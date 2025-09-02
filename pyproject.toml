@@ -17,17 +17,36 @@ readme = "README.md"
 dynamic = ["version"]
 
 dependencies = [
+    "boto3>=1.40.22",
+    "cloud-volume>=12.5.0",
+    "fastapi>=0.116.1",
+    "httpx>=0.28.1",
+    "numpy>=2.2.6",
+    "openai>=1.104.2",
+    "pillow>=11.3.0",
+    "polars>=1.33.0",
+    "pydantic>=2.11.7",
+    "python-multipart>=0.0.20",
+    "uvicorn[standard]>=0.35.0",
 ]
 
 [dependency-groups]
 dev = [
-    'black',
+    "black",
     'coverage',
-    'flake8',
-    'interrogate',
+    "flake8",
+    "interrogate",
     'isort',
     'Sphinx',
-    'furo'
+    'furo',
+    "ruff>=0.12.11",
+    "mypy>=1.17.1",
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.1.0",
+]
+panel = [
+    "panel>=1.7.5",
+    "panel-neuroglancer>=0.1.0",
 ]
 
 [tool.setuptools.packages.find]
