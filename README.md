@@ -12,7 +12,14 @@
 + frontend:
     + `$env:BACKEND = "http://127.0.0.1:8000"`
     + panel: `uv run python -m panel serve panel\panel_app.py --autoreload --port 8006 --address 127.0.0.1`
-    + open browera: http://localhost:8006
+    + panel chat:
+        ```bash
+            uv run python -m panel serve panel\panel_app.py `
+            --autoreload --port 8006 --address 127.0.0.1 `
+            --allow-websocket-origin=127.0.0.1:8006 `
+            --allow-websocket-origin=localhost:8006
+        ```
+    + open browser: http://localhost:8006
 
 ## Level of Support
 Please indicate a level of support:
