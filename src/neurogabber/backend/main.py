@@ -10,18 +10,19 @@ from .tools.neuroglancer_state import new_state, set_view as _set_view, set_lut 
 from .tools.plots import sample_voxels, histogram
 from .tools.io import load_csv, top_n_rois
 from .storage.states import save_state, load_state
-from .adapters.llm import run_chat
+from .adapters.llm import run_chat, SYSTEM_PROMPT
+
+import logging
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
 # In-memory working state per session (MVP). Replace with DB keyed by user/session.
 CURRENT_STATE = new_state()
 
-@app.post("/agent/chat")
-def chat(req: ChatRequest):
-    # Pass-through to LLM; client will call tool endpoints when tool calls arrive
-    out = run_chat([m.model_dump() for m in req.messages])
-    return out
+
 
 @app.post("/tools/ng_set_view")
 def t_set_view(args: SetView):
@@ -69,3 +70,46 @@ def t_save_state(_: SaveState):
     sid = save_state(CURRENT_STATE)
     url = to_url(CURRENT_STATE)
     return {"sid": sid, "url": url}
+
+# TODO
+#Optional (alternative path): if you prefer “read-only” to still be tool-based, 
+#add a tiny GET tool like ng_list_layers to the toolset. But since you asked for “no tool” for 
+#that query, the state-summary + system prompt approach above fits better.
+def _summarize_state(state: dict) -> str:
+    # Keep it short and deterministic. Expand as needed later.
+    layers = state.get("layers", [])
+    lines = []
+    lines.append(f"Layout: {state.get('layout','xy')}")
+    pos = state.get("position", [0,0,0])
+    lines.append(f"Position: {pos}")
+    if layers:
+        lines.append("Layers:")
+        for L in layers:
+            name = L.get("name","(unnamed)")
+            ltype = L.get("type","unknown")
+            lines.append(f"- {name} ({ltype})")
+    else:
+        lines.append("Layers: (none)")
+    print("Summarized state:", lines)  # Debug
+    return "\n".join(lines)
+
+
+# @app.post("/agent/chat")
+# def chat(req: ChatRequest):
+#     # Pass-through to LLM; client will call tool endpoints when tool calls arrive
+#     out = run_chat([m.model_dump() for m in req.messages])
+#     return out
+
+@app.post("/agent/chat")
+def chat(req: ChatRequest):
+    # Build augmented prompt with routing guidance + state summary
+    state_summary = _summarize_state(CURRENT_STATE)
+    preface = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": f"Current viewer state summary:\n{state_summary}"},
+    ]
+    logger.debug("Preface:\n%s", preface)
+    logger.debug("State summary:\n%s", state_summary)
+    out = run_chat(preface + [m.model_dump() for m in req.messages])
+    logger.debug("LLM response:%s", out)
+    return out
