@@ -2,7 +2,9 @@ import os, json, httpx, panel as pn
 from panel.chat import ChatInterface
 from panel_neuroglancer import Neuroglancer
 
-pn.extension('neuroglancer')  # enable the neuroglancer extension
+#pn.extension('neuroglancer')  # enable the neuroglancer extension
+pn.extension()  # enable the neuroglancer extension
+
 
 BACKEND = os.environ.get("BACKEND", "http://127.0.0.1:8000")
 
@@ -18,9 +20,9 @@ async def agent_call(prompt: str) -> str:
         data = resp.json()
 
         # 2) Execute tool calls
-        for choice in data.get("choices", []):
+        for choice in (data.get("choices") or []):
             msg = choice.get("message", {})
-            for tc in msg.get("tool_calls", []):
+            for tc in (msg.get("tool_calls") or []):
                 name = tc["function"]["name"]
                 args = json.loads(tc["function"]["arguments"] or "{}")
                 await client.post(f"{BACKEND}/tools/{name}", json=args)

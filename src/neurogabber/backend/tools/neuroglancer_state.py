@@ -3,7 +3,8 @@ from typing import Dict
 from urllib.parse import quote
 
 
-NEURO_BASE = os.getenv("NEUROGLANCER_BASE", "https://neuroglancer.github.io")
+#NEURO_BASE = os.getenv("NEUROGLANCER_BASE", "https://neuroglancer.github.io")
+NEURO_BASE = os.getenv("NEUROGLANCER_BASE", "https://neuroglancer-demo.appspot.com")
 
 
 # Minimal state object; extend with layers, shader params, annotations, etc.

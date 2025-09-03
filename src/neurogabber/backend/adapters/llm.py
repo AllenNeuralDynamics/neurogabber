@@ -39,7 +39,41 @@ TOOLS = [
     "function": {
       "name":"ng_annotations_add",
       "description":"Add annotations to a layer",
-      "parameters": {"type":"object","properties": {"layer":{"type":"string"},"items":{"type":"array"}},"required":["layer","items"]}
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "layer": {"type": "string"},
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {"type": "string"},
+                "type": {"type": "string", "enum": ["point", "box", "ellipsoid"]},
+                "center": {
+                  "type": "object",
+                  "properties": {
+                    "x": {"type": "number"},
+                    "y": {"type": "number"},
+                    "z": {"type": "number"}
+                  },
+                  "required": ["x", "y", "z"]
+                },
+                "size": {
+                  "type": "object",
+                  "properties": {
+                    "x": {"type": "number"},
+                    "y": {"type": "number"},
+                    "z": {"type": "number"}
+                  }
+                }
+              },
+              "required": ["type", "center"]
+            }
+          }
+        },
+        "required": ["layer", "items"]
+      }
     }
   },
   {
