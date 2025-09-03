@@ -99,7 +99,8 @@ TOOLS = [
       "parameters": {"type":"object","properties": {"file_id":{"type":"string"}},"required":["file_id"]}
     }
   },
-  {"type":"function","function": {"name":"state_save","description":"Save and return NG state URL","parameters":{"type":"object","properties":{}}}}
+  {"type":"function","function": {"name":"state_save","description":"Save and return NG state URL","parameters":{"type":"object","properties":{}}}},
+  {"type":"function","function": {"name":"state_load","description":"Load state from a Neuroglancer URL or fragment","parameters":{"type":"object","properties":{"link":{"type":"string"}},"required":["link"]}}}
 ]
 
 

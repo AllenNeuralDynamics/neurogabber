@@ -1,6 +1,6 @@
 import json, os, uuid
 from typing import Dict
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 
 #NEURO_BASE = os.getenv("NEUROGLANCER_BASE", "https://neuroglancer.github.io")
@@ -53,3 +53,30 @@ def to_url(state: Dict) -> str:
     # State is encoded in the URL hash; simplest path: json → urlencoded
     state_str = json.dumps(state, separators=(",", ":"))
     return f"{NEURO_BASE}#%7B{quote(state_str)[3:]}" # quick-and-dirty encoding
+
+
+def from_url(url_or_fragment: str) -> Dict:
+    """Parse a Neuroglancer URL (or just its hash fragment) into a state dict.
+
+    Accepts any of:
+    - Full URL like https://host/#!%7B...%7D
+    - Full URL like https://host/#%7B...%7D
+    - Just the fragment starting with '#', '#!' or the percent-encoded JSON itself
+    - A raw JSON string (for robustness)
+    """
+    s = url_or_fragment.strip()
+    # Extract the fragment if a full URL was provided
+    if '#' in s:
+        s = s.split('#', 1)[1]
+    # Drop the optional leading '!'
+    if s.startswith('!'):
+        s = s[1:]
+    # If this looks like percent-encoded JSON, unquote it
+    try:
+        decoded = unquote(s)
+        # If unquoting didn't change it and it's already JSON, keep as-is
+        candidate = decoded if decoded else s
+        return json.loads(candidate)
+    except Exception:
+        # Last resort: maybe it's already a JSON string without quoting
+        return json.loads(s)

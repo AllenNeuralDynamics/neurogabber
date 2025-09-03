@@ -6,7 +6,7 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(os.path.dir
 
 from fastapi import FastAPI, UploadFile, Body
 from .models import ChatRequest, SetView, SetLUT, AddAnnotations, HistogramReq, IngestCSV, SaveState
-from .tools.neuroglancer_state import new_state, set_view as _set_view, set_lut as _set_lut, add_annotations as _add_ann, to_url
+from .tools.neuroglancer_state import new_state, set_view as _set_view, set_lut as _set_lut, add_annotations as _add_ann, to_url, from_url
 from .tools.plots import sample_voxels, histogram
 from .tools.io import load_csv, top_n_rois
 from .storage.states import save_state, load_state
@@ -70,6 +70,24 @@ def t_save_state(_: SaveState):
     sid = save_state(CURRENT_STATE)
     url = to_url(CURRENT_STATE)
     return {"sid": sid, "url": url}
+
+
+@app.post("/tools/state_load")
+def t_state_load(link: str = Body(..., embed=True)):
+    """Load state from a Neuroglancer URL or fragment and set CURRENT_STATE."""
+    global CURRENT_STATE
+    try:
+        CURRENT_STATE = from_url(link)
+        return {"ok": True}
+    except Exception as e:
+        logger.exception("Failed to load state from link")
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/tools/demo_load")
+def t_demo_load(link: str = Body(..., embed=True)):
+    """Convenience: same as state_load, named for demos."""
+    return t_state_load(link)
 
 # TODO
 #Optional (alternative path): if you prefer “read-only” to still be tool-based, 

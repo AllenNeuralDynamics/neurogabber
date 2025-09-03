@@ -1,15 +1,37 @@
-import os, json, httpx, panel as pn
+import os, json, httpx, asyncio, panel as pn
 from panel.chat import ChatInterface
 from panel_neuroglancer import Neuroglancer
 
-#pn.extension('neuroglancer')  # enable the neuroglancer extension
 pn.extension()  # enable the neuroglancer extension
-
 
 BACKEND = os.environ.get("BACKEND", "http://127.0.0.1:8000")
 
 viewer = Neuroglancer()
 status = pn.pane.Markdown("Ready.")
+
+async def _notify_backend_state_load(url: str):
+    """Inform backend that the widget loaded a new NG URL so CURRENT_STATE is in sync."""
+    try:
+        status.object = "Syncing state to backend…"
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(f"{BACKEND}/tools/state_load", json={"link": url})
+            data = resp.json()
+            if not data.get("ok"):
+                status.object = f"Error syncing link: {data.get('error', 'unknown error')}"
+                return
+        status.object = f"**Opened:** {url}"
+    except Exception as e:
+        status.object = f"Error syncing: {e}"
+
+def _on_url_change(event):
+    # Called when the widget loads Demo or a user URL, or when we set viewer.url
+    new_url = event.new
+    if not new_url:
+        return
+    asyncio.create_task(_notify_backend_state_load(new_url))
+
+# Watch the Neuroglancer widget URL; use its built-in Demo/Load buttons
+viewer.param.watch(_on_url_change, 'url')
 async def agent_call(prompt: str) -> dict:
     """Return {'answer': str|None, 'url': str|None}."""
     async with httpx.AsyncClient(timeout=60) as client:
@@ -45,7 +67,7 @@ async def respond(contents: str, user: str, **kwargs):
     try:
         result = await agent_call(contents)
         if result["url"]:
-            viewer.source = result["url"]
+            viewer.url = result["url"]
             status.object = f"**Opened:** {result['url']}"
             if result["answer"]:
                 return f"{result['answer']}\n\n{result['url']}"
@@ -100,9 +122,12 @@ chat = ChatInterface(
 )
 
 app = pn.Row(
-    pn.Column(pn.pane.Markdown("# Neurogabber (Panel prototype)"), status, chat,
-              #sizing_mode="stretch_both"),
-              width=400),
+    pn.Column(
+        pn.pane.Markdown("# Neurogabber (Panel prototype)"),
+        status,
+        chat,
+        width=420,
+    ),
     pn.Column(viewer, sizing_mode="stretch_both"),
 )
 

@@ -13,6 +13,17 @@ status = pn.pane.Markdown("Ready.")
 
 viewer = Neuroglancer(source=ng_link)
 
+async def init_backend_state_from_demo():
+    # Push the demo link into the backend so CURRENT_STATE matches the viewer
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            await client.post(f"{BACKEND}/tools/state_load", json={"link": ng_link})
+        except Exception:
+            pass
+
+# Schedule background init on app load
+pn.state.onload(lambda: pn.state.run_async(init_backend_state_from_demo()))
+
 async def run(_):
     status.object = "Running…"
     async with httpx.AsyncClient(timeout=60) as client:
@@ -28,7 +39,7 @@ async def run(_):
                 args = json.loads(tc["function"]["arguments"] or "{}")
                 await client.post(f"{BACKEND}/tools/{name}", json=args)
         # 3) Save state and open the URL in the embedded NG widget
-        save = await client.post(f"{BACKEND}/tools/state.save", json={})
+    save = await client.post(f"{BACKEND}/tools/state_save", json={})
         url = save.json()["url"]
         viewer.source = url
         status.object = f"**Opened:** {url}"
