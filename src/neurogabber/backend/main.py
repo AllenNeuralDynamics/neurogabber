@@ -23,19 +23,19 @@ def chat(req: ChatRequest):
     out = run_chat([m.model_dump() for m in req.messages])
     return out
 
-@app.post("/tools/ng.set_view")
+@app.post("/tools/ng_set_view")
 def t_set_view(args: SetView):
     global CURRENT_STATE
     CURRENT_STATE = _set_view(CURRENT_STATE, args.center.model_dump(), args.zoom, args.orientation)
     return {"ok": True}
 
-@app.post("/tools/ng.set_lut")
+@app.post("/tools/ng_set_lut")
 def t_set_lut(args: SetLUT):
     global CURRENT_STATE
     CURRENT_STATE = _set_lut(CURRENT_STATE, args.layer, args.vmin, args.vmax)
     return {"ok": True}
 
-@app.post("/tools/ng.annotations.add")
+@app.post("/tools/ng_annotations_add")
 def t_add_annotations(args: AddAnnotations):
     global CURRENT_STATE
     items = []
@@ -51,20 +51,20 @@ def t_add_annotations(args: AddAnnotations):
     CURRENT_STATE = _add_ann(CURRENT_STATE, args.layer, items)
     return {"ok": True}
 
-@app.post("/tools/data.plot.histogram")
+@app.post("/tools/data_plot_histogram")
 def t_hist(args: HistogramReq):
     vox = sample_voxels(args.layer, args.roi)
     hist, edges = histogram(vox)
     return {"hist": hist.tolist(), "edges": edges.tolist()}
 
-@app.post("/tools/data.ingest.csv_rois")
+@app.post("/tools/data_ingest_csv_rois")
 def t_csv(args: IngestCSV):
     df = load_csv(args.file_id)
     rows = top_n_rois(df)
     # Optionally also add an annotation layer from rows here
     return {"rows": rows}
 
-@app.post("/tools/state.save")
+@app.post("/tools/state_save")
 def t_save_state(_: SaveState):
     sid = save_state(CURRENT_STATE)
     url = to_url(CURRENT_STATE)

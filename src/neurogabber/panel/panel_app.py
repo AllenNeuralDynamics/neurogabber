@@ -26,7 +26,7 @@ async def agent_call(prompt: str) -> str:
                 await client.post(f"{BACKEND}/tools/{name}", json=args)
 
         # 3) Save state and return URL
-        save = await client.post(f"{BACKEND}/tools/state.save", json={})
+        save = await client.post(f"{BACKEND}/tools/state_save", json={})
         return save.json()["url"]
 
 async def respond(contents: str, user: str, **kwargs):

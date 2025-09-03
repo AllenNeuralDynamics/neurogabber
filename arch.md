@@ -26,7 +26,7 @@ backend/
   models.py               # Pydantic schemas (Vec3, SetView, ...)
   tools/
     neuroglancer_state.py # state helpers (set_view, set_lut, add_annotations, to_url)
-    data_io.py            # CSV ingest (top_n_rois)
+    io.py                 # CSV ingest (top_n_rois)
     plots.py              # histogram sampling (stub)
   adapters/
     llm.py                # tool-calling adapter
@@ -44,16 +44,16 @@ frontend/
 1. **UI** sends user text → **POST** `/agent/chat`.
 2. **LLM** responds with `tool_calls`.
 3. UI (or server helper) **executes tools** in order via `/tools/*`.
-4. UI calls **`/tools/state.save`** → receives **Neuroglancer URL**.
+4. UI calls **`/tools/state_save`** → receives **Neuroglancer URL**.
 5. UI shows the URL (open in a tab) or sets `viewer.source` (Panel embed).
 
 ## Tool surface (HTTP endpoints)
-- `POST /tools/ng.set_view` → center/zoom/orientation.
-- `POST /tools/ng.set_lut` → LUT range per image layer.
-- `POST /tools/ng.annotations.add` → add points/boxes/ellipsoids.
-- `POST /tools/data.plot.histogram` → returns histogram bins/edges.
-- `POST /tools/data.ingest.csv_rois` → returns canonical ROI table (top‑N).
-- `POST /tools/state.save` → returns `{ sid, url }` for the current state.
+- `POST /tools/ng_set_view` → center/zoom/orientation.
+- `POST /tools/ng_set_lut` → LUT range per image layer.
+- `POST /tools/ng_annotations_add` → add points/boxes/ellipsoids.
+- `POST /tools/data_plot_histogram` → returns histogram bins/edges.
+- `POST /tools/data_ingest_csv_rois` → returns canonical ROI table (top‑N).
+- `POST /tools/state_save` → returns `{ sid, url }` for the current state.
 
 ## Current features
 - Prompt → **navigate**, **zoom to fit**, **toggle/add annotations**, **set LUT**.

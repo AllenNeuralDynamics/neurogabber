@@ -9,7 +9,7 @@ TOOLS = [
   {
     "type": "function",
     "function": {
-      "name": "ng.set_view",
+      "name": "ng_set_view",
       "description": "Set camera center/zoom/orientation",
       "parameters": {
         "type": "object",
@@ -25,7 +25,7 @@ TOOLS = [
   {
     "type":"function",
     "function": {
-      "name":"ng.set_lut",
+      "name":"ng_set_lut",
       "description":"Set value range for an image layer",
       "parameters": {
         "type":"object",
@@ -37,7 +37,7 @@ TOOLS = [
   {
     "type":"function",
     "function": {
-      "name":"ng.annotations.add",
+      "name":"ng_annotations_add",
       "description":"Add annotations to a layer",
       "parameters": {"type":"object","properties": {"layer":{"type":"string"},"items":{"type":"array"}},"required":["layer","items"]}
     }
@@ -45,7 +45,7 @@ TOOLS = [
   {
     "type":"function",
     "function": {
-      "name":"data.plot.histogram",
+      "name":"data_plot_histogram",
       "description":"Compute intensity histogram from layer/roi",
       "parameters": {"type":"object","properties": {"layer":{"type":"string"},"roi":{"type":"object"}},"required":["layer"]}
     }
@@ -53,12 +53,12 @@ TOOLS = [
   {
     "type":"function",
     "function": {
-      "name":"data.ingest.csv_rois",
+      "name":"data_ingest_csv_rois",
       "description":"Load CSV of ROIs and build canonical table",
       "parameters": {"type":"object","properties": {"file_id":{"type":"string"}},"required":["file_id"]}
     }
   },
-  {"type":"function","function": {"name":"state.save","description":"Save and return NG state URL","parameters":{"type":"object","properties":{}}}}
+  {"type":"function","function": {"name":"state_save","description":"Save and return NG state URL","parameters":{"type":"object","properties":{}}}}
 ]
 
 

@@ -43,7 +43,8 @@ def add_annotations(state: Dict, layer: str, items):
     if not ann:
         ann = {"type":"annotation", "name":layer, "source":{"annotations":[]}}
         state["layers"].append(ann)
-        ann["source"]["annotations"].extend(items)
+    # Always append new items
+    ann["source"].setdefault("annotations", []).extend(items)
     return state
 
 

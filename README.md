@@ -21,6 +21,10 @@
         ```
     + open browser: http://localhost:8006
 
++ tests
+    + `uv run -m coverage run -m pytest`
+    + `uv run -m coverage report`
+
 ## Level of Support
 Please indicate a level of support:
  - [ ] Supported: We are releasing this code to the public as a tool we expect others to use. Issues are welcomed, and we expect to address them promptly; pull requests will be vetted by our staff before inclusion.
