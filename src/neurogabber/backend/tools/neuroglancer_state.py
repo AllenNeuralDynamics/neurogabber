@@ -51,8 +51,10 @@ def set_view(state: Dict, center, zoom, orientation):
 def set_lut(state: Dict, layer_name: str, vmin: float, vmax: float):
     for L in state.get("layers", []):
         if L.get("name") == layer_name:
-            # Neuroglancer uses shaderControls / channel ranges depending on layer type
-            L.setdefault("shaderControls", {})["normalizedRange"] = [vmin, vmax]
+            sc = L.setdefault("shaderControls", {})
+            norm = sc.setdefault("normalized", {})
+            norm["range"] = [vmin, vmax]
+            break
     return state
 
 
