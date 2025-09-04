@@ -131,3 +131,75 @@ def chat(req: ChatRequest):
     out = run_chat(preface + [m.model_dump() for m in req.messages])
     logger.debug("LLM response:%s", out)
     return out
+
+
+def summarize_state_struct(state: dict, detail: str = "standard") -> dict:
+    """Produce a structured summary for LLM inspection.
+
+    detail levels:
+      - minimal: only layer name & type
+      - standard: adds counts & ranges
+      - full: adds shader length and source kinds
+    """
+    layers_out = []
+    for L in state.get("layers", []):
+        base = {"name": L.get("name"), "type": L.get("type")}
+        ltype = L.get("type")
+        if detail in ("standard", "full"):
+            if ltype == "image":
+                src = L.get("source")
+                if isinstance(src, list):
+                    base["num_sources"] = len(src)
+                    kinds = []
+                    for s in src:
+                        if isinstance(s, dict):
+                            url = s.get("url", "")
+                            if "://" in url:
+                                kinds.append(url.split("://",1)[0])
+                    if kinds:
+                        base["source_kinds"] = sorted(set(kinds))
+                rng = (L.get("shaderControls") or {}).get("normalized", {}).get("range")
+                if rng:
+                    base["normalized_range"] = rng
+            elif ltype == "annotation":
+                anns = (L.get("source") or {}).get("annotations") or []
+                base["annotation_count"] = len(anns)
+        if detail == "full":
+            shader = L.get("shader")
+            if shader:
+                base["shader_len"] = len(shader)
+        layers_out.append(base)
+
+    annotation_layers = []
+    for L in state.get("layers", []):
+        if L.get("type") == "annotation":
+            anns = (L.get("source") or {}).get("annotations") or []
+            types = set()
+            for a in anns:
+                t = a.get("type") or ("point" if "point" in a else None)
+                if t:
+                    types.add(t)
+            annotation_layers.append({
+                "name": L.get("name"),
+                "count": len(anns),
+                "types": sorted(types)
+            })
+
+    return {
+        "layout": state.get("layout"),
+        "position": state.get("position"),
+        "dimensions": state.get("dimensions"),
+        "layers": layers_out,
+        "annotation_layers": annotation_layers,
+        "flags": {
+            "showAxisLines": state.get("showAxisLines"),
+            "showScaleBar": state.get("showScaleBar"),
+        },
+        "version": 1,
+        "detail": detail,
+    }
+
+
+@app.post("/tools/ng_state_summary")
+def t_state_summary(detail: str = Body("standard", embed=True)):
+    return summarize_state_struct(CURRENT_STATE, detail=detail)

@@ -14,6 +14,17 @@ BACKEND = os.environ.get("BACKEND", "http://127.0.0.1:8000")
 viewer = Neuroglancer()
 status = pn.pane.Markdown("Ready.")
 
+# Settings widgets
+auto_load_checkbox = pn.widgets.Checkbox(name="Auto-load view", value=True)
+latest_url = pn.widgets.TextInput(name="Latest NG URL", value="", disabled=True)
+
+def _open_latest(_):
+    if latest_url.value:
+        viewer.url = latest_url.value
+
+open_latest_btn = pn.widgets.Button(name="Open latest link", button_type="primary")
+open_latest_btn.on_click(_open_latest)
+
 async def _notify_backend_state_load(url: str):
     """Inform backend that the widget loaded a new NG URL so CURRENT_STATE is in sync."""
     try:
@@ -72,8 +83,12 @@ async def respond(contents: str, user: str, **kwargs):
     try:
         result = await agent_call(contents)
         if result["url"]:
-            viewer.url = result["url"]
-            status.object = f"**Opened:** {result['url']}"
+            latest_url.value = result["url"]
+            if auto_load_checkbox.value:
+                viewer.url = result["url"]
+                status.object = f"**Opened:** {result['url']}"
+            else:
+                status.object = "New link generated (auto-load off)."
             if result["answer"]:
                 return f"{result['answer']}\n\n{result['url']}"
             return f"Updated Neuroglancer view.\n\n{result['url']}"
@@ -158,12 +173,18 @@ chat = ChatInterface(
      }
 )
 
+settings_card = pn.Card(
+    pn.Column(auto_load_checkbox, latest_url, open_latest_btn, status),
+    title="Settings",
+    collapsed=False,
+)
+
 app = pn.template.FastListTemplate(
     title=f"Neurogabber v {version}",
-    sidebar=[chat],
+    sidebar=[settings_card, chat],
     main=[viewer],
     sidebar_width=450,
-    theme = "dark"
+    theme="dark",
 )
 
 # # layout 2
