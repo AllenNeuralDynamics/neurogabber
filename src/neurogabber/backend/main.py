@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), '.env'))
 
-from fastapi import FastAPI, UploadFile, Body
+from fastapi import FastAPI, UploadFile, Body, Query
 from .models import ChatRequest, SetView, SetLUT, AddAnnotations, HistogramReq, IngestCSV, SaveState
 from .tools.neuroglancer_state import new_state, set_view as _set_view, set_lut as _set_lut, add_annotations as _add_ann, to_url, from_url
 from .tools.plots import sample_voxels, histogram
@@ -14,7 +14,7 @@ from .adapters.llm import run_chat, SYSTEM_PROMPT
 
 import logging
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
@@ -66,9 +66,21 @@ def t_csv(args: IngestCSV):
     return {"rows": rows}
 
 @app.post("/tools/state_save")
-def t_save_state(_: SaveState):
+def t_save_state(_: SaveState, mask: bool = Query(False, description="Return masked markdown link label instead of raw URL")):
+    """Persist current state and return its ID and URL.
+
+    If mask=true, also include 'masked_markdown' with a concise hyperlink label.
+    We do masking here (where state is definitively updated) instead of during
+    synthetic assistant message generation to avoid presenting stale links.
+    """
     sid = save_state(CURRENT_STATE)
     url = to_url(CURRENT_STATE)
+    if mask:
+        masked = _mask_ng_urls(url)
+        # If masking logic chooses not to transform (unlikely since it's a NG URL), fall back to manual label.
+        if masked == url:
+            masked = f"[Updated Neuroglancer view]({url})"
+        return {"sid": sid, "url": url, "masked_markdown": masked}
     return {"sid": sid, "url": url}
 
 
@@ -108,7 +120,6 @@ def _summarize_state(state: dict) -> str:
             lines.append(f"- {name} ({ltype})")
     else:
         lines.append("Layers: (none)")
-    print("Summarized state:", lines)  # Debug
     return "\n".join(lines)
 
 
@@ -130,14 +141,23 @@ def chat(req: ChatRequest):
     logger.debug("State summary:\n%s", state_summary)
     out = run_chat(preface + [m.model_dump() for m in req.messages])
     logger.debug("LLM response:%s", out)
-
+    logger.info("CHATTER HERE") # debug
     # Post-process assistant message content to mask raw Neuroglancer URLs.
     try:
         choices = out.get("choices") or []
+   
         for ch in choices:
             msg = ch.get("message") or {}
-            if msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
-                msg["content"] = _mask_ng_urls(msg["content"])
+            logger.debug(msg.get("role"))
+            if msg.get("role") == "assistant":
+                content = msg.get("content")
+                tool_calls = msg.get("tool_calls") or []
+                # Synthesize content if missing and we have tool calls
+                if (content is None or (isinstance(content, str) and not content.strip())) and tool_calls:
+                    msg["content"] = _synthesize_tool_call_message(tool_calls)
+                # Mask any raw NG URLs in (original or synthesized) content
+                if isinstance(msg.get("content"), str):
+                    msg["content"] = _mask_ng_urls(msg["content"])
     except Exception:  # pragma: no cover (defensive)
         logger.exception("Failed masking Neuroglancer URLs")
     return out
@@ -150,20 +170,62 @@ def _mask_ng_urls(text: str) -> str:
     multiple different URLs appear, they will receive a numeric suffix to
     differentiate: 'Updated Neuroglancer view (2)', etc.
     """
+    logger.info(f"{text}")
     import re
-    pattern = re.compile(r"https://neuroglancer-[^\s)]+#!%[0-9A-Za-z]+")
-    urls = pattern.findall(text)
+    url_pattern = re.compile(r"https?://[^\s)]+")
+    candidates = url_pattern.findall(text)
+    urls = [u for u in candidates if 'neuroglancer' in u]
+    # Also detect tokens missing scheme but containing neuroglancer + fragment (#!%7B)
+    if 'neuroglancer' in text and '#!%7B' in text:
+        tokens = re.split(r"\s+", text)
+        for tok in tokens:
+            if 'neuroglancer' in tok and '#!%7B' in tok and 'http' not in tok:
+                urls.append(tok)
     if not urls:
         return text
-    seen = {}
-    for i, u in enumerate(urls, start=1):
+    ordered = []
+    seen = set()
+    for u in urls:
         if u not in seen:
-            label = "Updated Neuroglancer view" if len(seen) == 0 else f"Updated Neuroglancer view ({len(seen)+1})"
-            seen[u] = f"[{label}]({u})"
-    # Replace longer matches first to avoid partial overlap issues (stable here anyway)
-    for raw, repl in seen.items():
-        text = text.replace(raw, repl)
+            ordered.append(u)
+            seen.add(u)
+    label_map = {}
+    for idx, u in enumerate(ordered):
+        base = "Updated Neuroglancer view" if idx == 0 else f"Updated Neuroglancer view ({idx+1})"
+        label_map[u] = f"[{base}]({u})"
+    for raw_url, repl in label_map.items():
+        text = text.replace(raw_url, repl)
     return text
+
+
+@app.post("/tools/ng_state_link")
+def t_state_link():
+    """Return current state link and masked markdown without persisting a new save id."""
+    url = to_url(CURRENT_STATE)
+    masked = _mask_ng_urls(url)
+    if masked == url:
+        masked = f"[Updated Neuroglancer view]({url})"
+    return {"url": url, "masked_markdown": masked}
+
+
+def _synthesize_tool_call_message(tool_calls) -> str:
+    """Create a concise assistant message summarizing tool calls (no link).
+
+    We intentionally do NOT embed a Neuroglancer state URL here because at this
+    point the client has not yet executed the tool calls; embedding a link
+    would show a stale pre-mutation state. The client can separately call
+    /tools/state_save (optionally with masking) AFTER applying tools to obtain
+    the authoritative updated link.
+    """
+    try:
+        names = []
+        for tc in tool_calls:
+            fn = (tc.get("function") or {}).get("name") or tc.get("type") or "tool"
+            names.append(fn)
+        tool_list = ", ".join(names)
+        return f"Applied tools: {tool_list}."
+    except Exception:
+        return "Applied tools."  # fallback
 
 
 def summarize_state_struct(state: dict, detail: str = "standard") -> dict:

@@ -1,4 +1,4 @@
-import os, json, httpx, asyncio, panel as pn
+import os, json, httpx, asyncio, re, panel as pn
 from panel.chat import ChatInterface
 from panel_neuroglancer import Neuroglancer
 
@@ -49,7 +49,12 @@ def _on_url_change(event):
 # Watch the Neuroglancer widget URL; use its built-in Demo/Load buttons
 viewer.param.watch(_on_url_change, 'url')
 async def agent_call(prompt: str) -> dict:
-    """Return {'answer': str|None, 'url': str|None}."""
+    """Return {'answer': str|None, 'url': str|None, 'masked': str|None}.
+
+    Uses tool execution pattern then fetches a masked link via ng_state_link
+    (no persistence). If persistence is desired, could optionally call
+    state_save with mask=1.
+    """
     async with httpx.AsyncClient(timeout=60) as client:
         chat = {"messages": [{"role": "user", "content": prompt}]}
         resp = await client.post(f"{BACKEND}/agent/chat", json=chat)
@@ -66,35 +71,55 @@ async def agent_call(prompt: str) -> dict:
 
         if not tool_calls:
             # Conversational: no state change
-            return {"answer": answer or "(no response)", "url": None}
+            return {"answer": answer or "(no response)", "url": None, "masked": None}
 
-        # Execute tool calls
+        # Execute tool calls sequentially
         for tc in tool_calls:
             name = tc["function"]["name"]
             args = json.loads(tc["function"]["arguments"] or "{}")
             await client.post(f"{BACKEND}/tools/{name}", json=args)
 
-        # Save state and return URL
-        save = await client.post(f"{BACKEND}/tools/state_save", json={})
-        return {"answer": answer, "url": save.json()["url"]}
+        # Fetch current masked link (no persistence) after mutations BEFORE closing client
+        link_resp = await client.post(f"{BACKEND}/tools/ng_state_link")
+        link_data = link_resp.json()
+        return {"answer": answer, "url": link_data.get("url"), "masked": link_data.get("masked_markdown")}
+
+def _mask_client_side(text: str) -> str:
+    """Safety net masking on frontend: collapse raw Neuroglancer URLs.
+
+    Mirrors backend labeling but simpler (does not number multiple distinct URLs).
+    """
+    if not text:
+        return text
+    url_pattern = re.compile(r"https?://[^\s)]+")
+    def repl(m):
+        u = m.group(0)
+        if 'neuroglancer' in u:
+            return f"[Updated Neuroglancer view]({u})"
+        return u
+    return url_pattern.sub(repl, text)
+
 
 async def respond(contents: str, user: str, **kwargs):
     status.object = "Running…"
     try:
         result = await agent_call(contents)
         if result["url"]:
-            latest_url.value = result["url"]
+            latest_url.value = result["url"] or ""
             if auto_load_checkbox.value:
                 viewer.url = result["url"]
                 status.object = f"**Opened:** {result['url']}"
             else:
                 status.object = "New link generated (auto-load off)."
-            if result["answer"]:
-                return f"{result['answer']}\n\n{result['url']}"
-            return f"Updated Neuroglancer view.\n\n{result['url']}"
+            masked = result.get("masked") or f"[Updated Neuroglancer view]({result['url']})"
+            # Also mask any raw NG links that might appear in the answer
+            safe_answer = _mask_client_side(result["answer"]) if result.get("answer") else None
+            if safe_answer:
+                return f"{safe_answer}\n\n{masked}"
+            return masked
         else:
             status.object = "Done."
-            return result["answer"]
+            return _mask_client_side(result["answer"]) if result.get("answer") else "(no response)"
     except Exception as e:
         status.object = f"Error: {e}"
         return f"Error: {e}"
@@ -181,7 +206,9 @@ settings_card = pn.Card(
 
 app = pn.template.FastListTemplate(
     title=f"Neurogabber v {version}",
-    sidebar=[settings_card, chat],
+    sidebar=[chat],
+    right_sidebar=settings_card,
+    collapsed_right_sidebar = True,
     main=[viewer],
     sidebar_width=450,
     theme="dark",

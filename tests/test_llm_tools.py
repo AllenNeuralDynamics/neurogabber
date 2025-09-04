@@ -19,4 +19,5 @@ def test_tool_names_are_underscored_and_valid():
         "state_save",
         "state_load",
         "ng_state_summary",
+        "ng_state_link",
     }
