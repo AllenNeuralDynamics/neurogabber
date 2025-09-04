@@ -2,7 +2,12 @@ import os, json, httpx, asyncio, panel as pn
 from panel.chat import ChatInterface
 from panel_neuroglancer import Neuroglancer
 
+# get version from package metadata init
+from importlib.metadata import version
+version = version("neurogabber")
+pn.config.theme = 'dark'
 pn.extension()  # enable the neuroglancer extension
+pn.extension(theme='dark')
 
 BACKEND = os.environ.get("BACKEND", "http://127.0.0.1:8000")
 
@@ -112,25 +117,67 @@ async def respond(contents: str, user: str, **kwargs):
 #         return f"Error: {e}"
 
 chat = ChatInterface(
-    user="You",
-    avatar="?",
+    user="User",
+    avatar="👤",
     callback_user="Agent",
+    show_activity_dot=True,
     callback=respond,         # async callback
-    #show_avatars=True,
-    height=360,
+    height=1000,
+    #buttons
     show_button_name=False,
+    # chat ui
+    show_avatar=False,
+    show_reaction_icons=False,
+    show_copy_icon=False,
+    show_timestamp=False,
+     message_params={   
+         # .meta { display: none; }
+         #             .avatar { display: none; }
+         #center { min-height: 30px; background-color: lightgrey; }
+         #.left { width: 2px; height: 2px; }
+         #.avatar { width: 5px; height: 5px; min-width: 5px; min-height: 5px; }
+         #.right{ background-color: red; }
+         #.meta { display: none; height: 0px; }
+        "stylesheets": [
+            """
+            .message {
+                font-size: 1em;
+
+                padding: 4px;
+            }
+            .name {
+                font-size: 0.9em;
+            }
+            .timestamp {
+                font-size: 0.9em;
+            }
+            
+            
+            """
+        ]
+     }
 )
 
-app = pn.Row(
-    pn.Column(
-        pn.pane.Markdown("# Neurogabber (Panel prototype)"),
-        status,
-        chat,
-        width=420,
-    ),
-    pn.Column(viewer, sizing_mode="stretch_both"),
+app = pn.template.FastListTemplate(
+    title=f"Neurogabber v {version}",
+    sidebar=[chat],
+    main=[viewer],
+    sidebar_width=450,
+    theme = "dark"
 )
 
+# # layout 2
+# app = pn.Row(
+#     pn.Column(
+#         pn.pane.Markdown("# Neurogabber (Panel prototype)"),
+#         #status, shows full NG link
+#         chat,
+#         width=420,
+#     ),
+#     pn.Column(viewer, sizing_mode="stretch_both"),
+# )
+
+# old layoout
 # app = pn.Column(
 #     pn.pane.Markdown("# Neurogabber (Panel prototype)"),
 #     status,
