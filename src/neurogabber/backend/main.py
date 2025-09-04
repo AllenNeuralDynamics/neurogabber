@@ -130,7 +130,40 @@ def chat(req: ChatRequest):
     logger.debug("State summary:\n%s", state_summary)
     out = run_chat(preface + [m.model_dump() for m in req.messages])
     logger.debug("LLM response:%s", out)
+
+    # Post-process assistant message content to mask raw Neuroglancer URLs.
+    try:
+        choices = out.get("choices") or []
+        for ch in choices:
+            msg = ch.get("message") or {}
+            if msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
+                msg["content"] = _mask_ng_urls(msg["content"])
+    except Exception:  # pragma: no cover (defensive)
+        logger.exception("Failed masking Neuroglancer URLs")
     return out
+
+
+def _mask_ng_urls(text: str) -> str:
+    """Replace full Neuroglancer URLs with a concise markdown hyperlink.
+
+    Each distinct URL is collapsed to the label 'Updated Neuroglancer view'. If
+    multiple different URLs appear, they will receive a numeric suffix to
+    differentiate: 'Updated Neuroglancer view (2)', etc.
+    """
+    import re
+    pattern = re.compile(r"https://neuroglancer-[^\s)]+#!%[0-9A-Za-z]+")
+    urls = pattern.findall(text)
+    if not urls:
+        return text
+    seen = {}
+    for i, u in enumerate(urls, start=1):
+        if u not in seen:
+            label = "Updated Neuroglancer view" if len(seen) == 0 else f"Updated Neuroglancer view ({len(seen)+1})"
+            seen[u] = f"[{label}]({u})"
+    # Replace longer matches first to avoid partial overlap issues (stable here anyway)
+    for raw, repl in seen.items():
+        text = text.replace(raw, repl)
+    return text
 
 
 def summarize_state_struct(state: dict, detail: str = "standard") -> dict:

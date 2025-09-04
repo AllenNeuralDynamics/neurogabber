@@ -67,17 +67,34 @@ def add_annotations(state: Dict, layer: str, items):
     return state
 
 
-def to_url(state: Dict) -> str:
-    """Serialize a full Neuroglancer state dict to a shareable URL.
+def to_url(state) -> str:
+    """Serialize a Neuroglancer state to a shareable URL.
 
-    Uses deterministic JSON (sorted keys) so tests can assert round‑trip
-    equality after parsing. We percent-encode the entire JSON object and
-    append it after a '#'. Neuroglancer also tolerates a leading '!'; we omit
-    it here for simplicity.
+    Accepts:
+      - a dict (canonical case)
+      - a full Neuroglancer URL (idempotent: returns normalized form)
+      - a fragment starting with '#', '#!' or raw percent-encoded JSON
+      - a raw JSON string
+
+    This makes accidental double-calls (e.g. ``to_url(to_url(state))``) safe by
+    detecting string inputs and parsing them back to a dict before serializing
+    again. Deterministic JSON (sorted keys, compact separators) ensures stable
+    tests and reproducible links.
     """
+    # If caller passed a string, attempt to parse it to a dict first.
+    if isinstance(state, str):
+        try:
+            state = from_url(state)  # re-use robust parser above
+        except Exception as e:  # pragma: no cover (defensive)
+            raise ValueError(f"to_url() received a string that is not a valid Neuroglancer state: {e}")
+
+    if not isinstance(state, dict):  # pragma: no cover (defensive)
+        raise TypeError("to_url() expects a dict or serializable state string")
+
     state_str = json.dumps(state, separators=(",", ":"), sort_keys=True)
     encoded = quote(state_str, safe="")
-    return f"{NEURO_BASE}#{encoded}"
+    # Neuroglancer canonical form uses '#!' before the JSON; include it.
+    return f"{NEURO_BASE}#!{encoded}"
 
 
 def from_url(url_or_fragment: str) -> Dict:

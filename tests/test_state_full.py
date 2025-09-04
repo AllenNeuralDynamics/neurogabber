@@ -10,6 +10,18 @@ def test_round_trip_full_state():
     assert parsed == STATE_DICT
 
 
+def test_to_url_idempotent_on_url():
+    # First serialization
+    url1 = to_url(STATE_DICT)
+    # Second call with already serialized URL should yield identical string
+    url2 = to_url(url1)
+    assert url1 == url2
+    # Fragment should start with an encoded '{' (%7B) not a quote (%22)
+    frag = url2.split('#', 1)[1]
+    # With canonical '#!' form we expect leading '!%7B'
+    assert frag.startswith('!%7B')
+
+
 def test_set_view_preserves_extra_keys():
     state = copy.deepcopy(STATE_DICT)
     original_keys = set(state.keys())
