@@ -136,6 +136,7 @@ async def respond(contents: str, user: str, **kwargs):
                 if link != last_loaded_url:
                     if auto_load_checkbox.value:
                         viewer.url = link
+                        viewer._load_url()
                         last_loaded_url = link
                         status.object = f"**Opened:** {link}"
                     else:
