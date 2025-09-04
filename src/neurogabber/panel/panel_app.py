@@ -14,6 +14,18 @@ BACKEND = os.environ.get("BACKEND", "http://127.0.0.1:8000")
 viewer = Neuroglancer()
 status = pn.pane.Markdown("Ready.")
 
+# Track last loaded Neuroglancer URL (dedupe reloads)
+last_loaded_url: str | None = None
+
+# Tools that mutate the shared Neuroglancer state; if any run we should refresh viewer
+MUTATING_TOOLS = {
+    "ng_set_view",
+    "ng_set_lut",
+    "ng_annotations_add",
+    "state_load",            # replaces entire state
+    "data_ingest_csv_rois",  # may add an annotation layer
+}
+
 # Settings widgets
 auto_load_checkbox = pn.widgets.Checkbox(name="Auto-load view", value=True)
 latest_url = pn.widgets.TextInput(name="Latest NG URL", value="", disabled=True)
@@ -49,11 +61,11 @@ def _on_url_change(event):
 # Watch the Neuroglancer widget URL; use its built-in Demo/Load buttons
 viewer.param.watch(_on_url_change, 'url')
 async def agent_call(prompt: str) -> dict:
-    """Return {'answer': str|None, 'url': str|None, 'masked': str|None}.
+    """Return {'answer': str|None, 'url': str|None, 'masked': str|None, 'tools': [str]}.
 
-    Uses tool execution pattern then fetches a masked link via ng_state_link
-    (no persistence). If persistence is desired, could optionally call
-    state_save with mask=1.
+    Execute tool calls then fetch current masked link via ng_state_link (no
+    persistence). Include executed tool names so caller can decide whether to
+    auto-load the viewer based on mutation.
     """
     async with httpx.AsyncClient(timeout=60) as client:
         chat = {"messages": [{"role": "user", "content": prompt}]}
@@ -74,15 +86,22 @@ async def agent_call(prompt: str) -> dict:
             return {"answer": answer or "(no response)", "url": None, "masked": None}
 
         # Execute tool calls sequentially
+        executed = []
         for tc in tool_calls:
             name = tc["function"]["name"]
             args = json.loads(tc["function"]["arguments"] or "{}")
             await client.post(f"{BACKEND}/tools/{name}", json=args)
+            executed.append(name)
 
         # Fetch current masked link (no persistence) after mutations BEFORE closing client
         link_resp = await client.post(f"{BACKEND}/tools/ng_state_link")
         link_data = link_resp.json()
-        return {"answer": answer, "url": link_data.get("url"), "masked": link_data.get("masked_markdown")}
+        return {
+            "answer": answer,
+            "url": link_data.get("url"),
+            "masked": link_data.get("masked_markdown"),
+            "tools": executed,
+        }
 
 def _mask_client_side(text: str) -> str:
     """Safety net masking on frontend: collapse raw Neuroglancer URLs.
@@ -101,25 +120,37 @@ def _mask_client_side(text: str) -> str:
 
 
 async def respond(contents: str, user: str, **kwargs):
+    global last_loaded_url
     status.object = "Running…"
     try:
         result = await agent_call(contents)
-        if result["url"]:
-            latest_url.value = result["url"] or ""
-            if auto_load_checkbox.value:
-                viewer.url = result["url"]
-                status.object = f"**Opened:** {result['url']}"
+        link = result.get("url")
+        executed = set(result.get("tools") or [])
+        mutated = bool(executed & MUTATING_TOOLS)
+        safe_answer = _mask_client_side(result.get("answer")) if result.get("answer") else None
+
+        if link:
+            latest_url.value = link or ""
+            masked = result.get("masked") or f"[Updated Neuroglancer view]({link})"
+            if mutated:
+                if link != last_loaded_url:
+                    if auto_load_checkbox.value:
+                        viewer.url = link
+                        last_loaded_url = link
+                        status.object = f"**Opened:** {link}"
+                    else:
+                        status.object = "New link generated (auto-load off)."
+                else:
+                    status.object = "State updated (no link change)."
             else:
-                status.object = "New link generated (auto-load off)."
-            masked = result.get("masked") or f"[Updated Neuroglancer view]({result['url']})"
-            # Also mask any raw NG links that might appear in the answer
-            safe_answer = _mask_client_side(result["answer"]) if result.get("answer") else None
+                status.object = "Completed (no view change)."
+
             if safe_answer:
                 return f"{safe_answer}\n\n{masked}"
             return masked
         else:
             status.object = "Done."
-            return _mask_client_side(result["answer"]) if result.get("answer") else "(no response)"
+            return safe_answer if safe_answer else "(no response)"
     except Exception as e:
         status.object = f"Error: {e}"
         return f"Error: {e}"
@@ -213,25 +244,5 @@ app = pn.template.FastListTemplate(
     sidebar_width=450,
     theme="dark",
 )
-
-# # layout 2
-# app = pn.Row(
-#     pn.Column(
-#         pn.pane.Markdown("# Neurogabber (Panel prototype)"),
-#         #status, shows full NG link
-#         chat,
-#         width=420,
-#     ),
-#     pn.Column(viewer, sizing_mode="stretch_both"),
-# )
-
-# old layoout
-# app = pn.Column(
-#     pn.pane.Markdown("# Neurogabber (Panel prototype)"),
-#     status,
-#     chat,
-#     viewer,
-#     sizing_mode="stretch_both"
-# )
 
 app.servable()

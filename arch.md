@@ -43,17 +43,20 @@ frontend/
 ## Data flow (prompt → view)
 1. **UI** sends user text → **POST** `/agent/chat`.
 2. **LLM** responds with `tool_calls`.
-3. UI (or server helper) **executes tools** in order via `/tools/*`.
-4. UI calls **`/tools/state_save`** → receives **Neuroglancer URL**.
-5. UI shows the URL (open in a tab) or sets `viewer.source` (Panel embed).
+3. UI (or server helper) **executes tools** sequentially via `/tools/*`.
+4. UI requests **`/tools/ng_state_link`** (non-persisting) to obtain the *current* Neuroglancer state URL plus a **masked markdown hyperlink**.
+5. Panel UI: if any executed tool was state‑mutating (e.g., `ng_set_view`, `ng_set_lut`, `ng_annotations_add`, `state_load`, `data_ingest_csv_rois`) and the URL differs from the last loaded one AND the "Auto-load view" checkbox is enabled, it updates the embedded Neuroglancer widget. Otherwise it just updates the stored "Latest NG URL" field.
+6. Persistence (`/tools/state_save`) is only called when the user explicitly asks to save/store a state; otherwise navigation remains ephemeral.
 
 ## Tool surface (HTTP endpoints)
-- `POST /tools/ng_set_view` → center/zoom/orientation.
-- `POST /tools/ng_set_lut` → LUT range per image layer.
-- `POST /tools/ng_annotations_add` → add points/boxes/ellipsoids.
-- `POST /tools/data_plot_histogram` → returns histogram bins/edges.
-- `POST /tools/data_ingest_csv_rois` → returns canonical ROI table (top‑N).
-- `POST /tools/state_save` → returns `{ sid, url }` for the current state.
+- `POST /tools/ng_set_view` → center/zoom/orientation (mutating).
+- `POST /tools/ng_set_lut` → LUT range per image layer (mutating).
+- `POST /tools/ng_annotations_add` → add points/boxes/ellipsoids (mutating).
+- `POST /tools/data_ingest_csv_rois` → returns canonical ROI table (top‑N) and may create an annotation layer (mutating).
+- `POST /tools/data_plot_histogram` → returns histogram bins/edges (read-only).
+- `POST /tools/ng_state_summary` → structured snapshot of current state (read-only, assists LLM reasoning).
+- `POST /tools/ng_state_link` → current state URL + masked markdown (read-only, no persistence).
+- `POST /tools/state_save` → persist snapshot, returns `{ sid, url }`.
 
 ## Current features
 - Prompt → **navigate**, **zoom to fit**, **toggle/add annotations**, **set LUT**.
