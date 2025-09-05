@@ -52,3 +52,21 @@ Alternatively, if using `uv`, run
 ```bash
 uv sync
 ```
+
+## Features
+
+* Chat-driven Neuroglancer view manipulation via tool calls
+* FastAPI backend with pluggable data & visualization tools
+* Panel-based UI prototype embedding a Neuroglancer viewer
+* Full Neuroglancer state retention (layers, transforms, shader controls, layout) with deterministic URL round‑trip
+* Optional auto-load toggle for applying newly generated Neuroglancer views
+
+## Neuroglancer State Handling
+
+The backend now preserves the *entire* Neuroglancer JSON state parsed from any loaded URL (including complex multi-panel layouts, per-layer transforms, shader code/controls, etc.). Tool mutators (`ng_set_view`, `ng_set_lut`, `ng_annotations_add`) only touch the specific fields they need without pruning unrelated keys. Position updates preserve a 4th temporal component when present. A `zoom == "fit"` request recenters without altering the existing layout, helping maintain multi-panel arrangements.
+
+Serialization (`state_save`) uses deterministic JSON ordering so round‑trip tests can assert `from_url(to_url(state)) == state` for typical viewer states.
+
+## Auto‑Load Toggle
+
+In the Panel UI a Settings card provides an "Auto-load view" checkbox (default ON). When disabled, generated URLs are shown in chat and placed in a read‑only "Latest NG URL" field; click "Open latest link" to manually apply. This affords manual inspection or batching of tool operations before updating the viewer.

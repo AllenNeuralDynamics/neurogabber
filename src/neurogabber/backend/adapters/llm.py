@@ -5,11 +5,13 @@ from openai import OpenAI
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 SYSTEM_PROMPT = """You are Neurogabber, a helpful assistant for Neuroglancer.
-Decide whether to take action with tools or just answer:
-- If the user asks for information you can answer from the provided 'Current viewer state summary' or general knowledge, respond directly with text. Do NOT call tools.
-- If the user asks to change the view, layers, LUTs, or data, call the appropriate tool(s).
-- If you need data not in the state summary (e.g., a computation), call a tool.
-Always keep answers concise. If you call tools, you may include a brief explanation first."""
+Decision rules:
+- If the user only wants information answer directly from the provided 'Current viewer state summary' (no tools).
+- If the user wants to modify the view (camera, LUTs, annotations, layers) call the corresponding tool(s).
+- If unsure of layer names or ranges, call ng_state_summary first (detail='standard' unless user requests otherwise).
+- After performing modifications, if the user requests a link or updated view, call ng_state_link (NOT state_save) to return a masked markdown hyperlink. Only call state_save when explicit persistence is requested (e.g. 'save', 'persist', 'store').
+- Do not paste raw Neuroglancer URLs directly; always rely on ng_state_link for sharing the current view.
+Keep answers concise. Provide brief rationale before tool calls when helpful. Avoid redundant summaries."""
 
 # Define available tools (schemas must match your Pydantic models)
 TOOLS = [
@@ -100,13 +102,16 @@ TOOLS = [
     }
   },
   {"type":"function","function": {"name":"state_save","description":"Save and return NG state URL","parameters":{"type":"object","properties":{}}}},
-  {"type":"function","function": {"name":"state_load","description":"Load state from a Neuroglancer URL or fragment","parameters":{"type":"object","properties":{"link":{"type":"string"}},"required":["link"]}}}
+  {"type":"function","function": {"name":"state_load","description":"Load state from a Neuroglancer URL or fragment","parameters":{"type":"object","properties":{"link":{"type":"string"}},"required":["link"]}}},
+  {"type":"function","function": {"name":"ng_state_summary","description":"Get structured summary of current Neuroglancer state for reasoning. Use before modifications if unsure of layer names or ranges.","parameters":{"type":"object","properties":{"detail":{"type":"string","enum":["minimal","standard","full"],"default":"standard"}}}}},
+  {"type":"function","function": {"name":"ng_state_link","description":"Return current state Neuroglancer link plus masked markdown hyperlink (use after modifications when user requests link).","parameters":{"type":"object","properties":{}}}}
 ]
 
 
 def run_chat(messages: List[Dict]) -> Dict:
     resp = client.chat.completions.create(
-        model="gpt-4o-mini",  # any tool-capable model
+        #model="gpt-4o-mini",  # any tool-capable model
+        model="gpt-5-mini",  # any tool-capable model
         messages=messages,
         tools=TOOLS,
         tool_choice="auto"

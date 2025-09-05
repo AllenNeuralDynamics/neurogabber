@@ -21,20 +21,40 @@ def new_state() -> Dict:
 
 # Utility mutators
 def set_view(state: Dict, center, zoom, orientation):
-    state["position"] = [center["x"], center["y"], center["z"]]
-    if zoom == "fit":
-        state["crossSectionScale"] = 1.0 # placeholder; tune per dataset size
+    """Update viewer center/zoom while preserving higher dimensional components.
+
+    If an existing position has 4 components (e.g. x,y,z,t) we keep the 4th value
+    untouched. We only overwrite the layout when an explicit non-"fit" zoom is
+    provided (mirroring earlier behavior) so that loading a complex multi-panel
+    layout and issuing a simple recenter with zoom=='fit' does not collapse it.
+    """
+    old_pos = state.get("position", [])
+    # Preserve temporal (or other) trailing component if present
+    if isinstance(old_pos, list) and len(old_pos) == 4:
+        state["position"] = [center["x"], center["y"], center["z"], old_pos[3]]
     else:
-        state["crossSectionScale"] = float(zoom)
-        state["layout"] = orientation
+        state["position"] = [center["x"], center["y"], center["z"]]
+
+    if zoom == "fit":
+        # Do not touch layout for a "fit" recenter-only request
+        state["crossSectionScale"] = 1.0  # placeholder; tune per dataset size
+    else:
+        try:
+            state["crossSectionScale"] = float(zoom)
+        except Exception:
+            # Fallback: ignore invalid zooms gracefully
+            pass
+        state["layout"] = orientation or state.get("layout", "xy")
     return state
 
 
 def set_lut(state: Dict, layer_name: str, vmin: float, vmax: float):
     for L in state.get("layers", []):
         if L.get("name") == layer_name:
-            # Neuroglancer uses shaderControls / channel ranges depending on layer type
-            L.setdefault("shaderControls", {})["normalizedRange"] = [vmin, vmax]
+            sc = L.setdefault("shaderControls", {})
+            norm = sc.setdefault("normalized", {})
+            norm["range"] = [vmin, vmax]
+            break
     return state
 
 
@@ -49,10 +69,34 @@ def add_annotations(state: Dict, layer: str, items):
     return state
 
 
-def to_url(state: Dict) -> str:
-    # State is encoded in the URL hash; simplest path: json → urlencoded
-    state_str = json.dumps(state, separators=(",", ":"))
-    return f"{NEURO_BASE}#%7B{quote(state_str)[3:]}" # quick-and-dirty encoding
+def to_url(state) -> str:
+    """Serialize a Neuroglancer state to a shareable URL.
+
+    Accepts:
+      - a dict (canonical case)
+      - a full Neuroglancer URL (idempotent: returns normalized form)
+      - a fragment starting with '#', '#!' or raw percent-encoded JSON
+      - a raw JSON string
+
+    This makes accidental double-calls (e.g. ``to_url(to_url(state))``) safe by
+    detecting string inputs and parsing them back to a dict before serializing
+    again. Deterministic JSON (sorted keys, compact separators) ensures stable
+    tests and reproducible links.
+    """
+    # If caller passed a string, attempt to parse it to a dict first.
+    if isinstance(state, str):
+        try:
+            state = from_url(state)  # re-use robust parser above
+        except Exception as e:  # pragma: no cover (defensive)
+            raise ValueError(f"to_url() received a string that is not a valid Neuroglancer state: {e}")
+
+    if not isinstance(state, dict):  # pragma: no cover (defensive)
+        raise TypeError("to_url() expects a dict or serializable state string")
+
+    state_str = json.dumps(state, separators=(",", ":"), sort_keys=True)
+    encoded = quote(state_str, safe="")
+    # Neuroglancer canonical form uses '#!' before the JSON; include it.
+    return f"{NEURO_BASE}#!{encoded}"
 
 
 def from_url(url_or_fragment: str) -> Dict:
