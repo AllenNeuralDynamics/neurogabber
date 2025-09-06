@@ -56,10 +56,12 @@ uv sync
 ## Features
 
 * Chat-driven Neuroglancer view manipulation via tool calls
-* FastAPI backend with pluggable data & visualization tools
+* Iterative server-side tool execution loop (model -> tools -> model) for grounded answers
+* FastAPI backend with pluggable data & visualization tools (Polars-based dataframe utilities)
 * Panel-based UI prototype embedding a Neuroglancer viewer
 * Full Neuroglancer state retention (layers, transforms, shader controls, layout) with deterministic URL round‑trip
 * Optional auto-load toggle for applying newly generated Neuroglancer views
+* `data_info` tool for dataframe metadata (shape, columns, dtypes, sample rows)
 
 ## Neuroglancer State Handling
 

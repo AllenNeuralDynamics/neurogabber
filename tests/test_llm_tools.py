@@ -20,4 +20,10 @@ def test_tool_names_are_underscored_and_valid():
         "state_load",
         "ng_state_summary",
         "ng_state_link",
+        "data_info",
+        "data_list_files",
+        "data_preview",
+        "data_describe",
+        "data_select",
+        "data_list_summaries",
     }

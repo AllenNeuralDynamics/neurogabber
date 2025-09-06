@@ -1,4 +1,5 @@
-import os, json, httpx, asyncio, re, panel as pn
+import os, json, httpx, asyncio, re, panel as pn, io
+from datetime import datetime
 from panel.chat import ChatInterface
 from panel_neuroglancer import Neuroglancer
 
@@ -8,6 +9,8 @@ version = version("neurogabber")
 pn.config.theme = 'dark'
 pn.extension()  # enable the neuroglancer extension
 pn.extension(theme='dark')
+pn.extension('tabulator')
+pn.extension('filedropper')
 
 BACKEND = os.environ.get("BACKEND", "http://127.0.0.1:8000")
 
@@ -17,18 +20,15 @@ status = pn.pane.Markdown("Ready.")
 # Track last loaded Neuroglancer URL (dedupe reloads)
 last_loaded_url: str | None = None
 
-# Tools that mutate the shared Neuroglancer state; if any run we should refresh viewer
-MUTATING_TOOLS = {
-    "ng_set_view",
-    "ng_set_lut",
-    "ng_annotations_add",
-    "state_load",            # replaces entire state
-    "data_ingest_csv_rois",  # may add an annotation layer
-}
+# Mutation detection now handled server-side; state link returned directly when mutated.
 
 # Settings widgets
 auto_load_checkbox = pn.widgets.Checkbox(name="Auto-load view", value=True)
 latest_url = pn.widgets.TextInput(name="Latest NG URL", value="", disabled=True)
+trace_history_checkbox = pn.widgets.Checkbox(name="Trace history", value=False)
+trace_history_length = pn.widgets.IntInput(name="History N", value=5)
+trace_download = pn.widgets.FileDownload(label="Download traces", filename="trace_history.json", button_type="primary", disabled=True)
+_trace_history: list[dict] = []
 
 def _open_latest(_):
     if latest_url.value:
@@ -61,46 +61,30 @@ def _on_url_change(event):
 # Watch the Neuroglancer widget URL; use its built-in Demo/Load buttons
 viewer.param.watch(_on_url_change, 'url')
 async def agent_call(prompt: str) -> dict:
-    """Return {'answer': str|None, 'url': str|None, 'masked': str|None, 'tools': [str]}.
+    """Call backend iterative chat once; backend executes tools.
 
-    Execute tool calls then fetch current masked link via ng_state_link (no
-    persistence). Include executed tool names so caller can decide whether to
-    auto-load the viewer based on mutation.
+    Returns:
+      answer: final assistant message
+      mutated: bool indicating any mutating tool executed server-side
+      url/masked: Neuroglancer link info if mutated (present only when mutated)
     """
-    async with httpx.AsyncClient(timeout=60) as client:
-        chat = {"messages": [{"role": "user", "content": prompt}]}
-        resp = await client.post(f"{BACKEND}/agent/chat", json=chat)
+    async with httpx.AsyncClient(timeout=120) as client:
+        chat_payload = {"messages": [{"role": "user", "content": prompt}]}
+        resp = await client.post(f"{BACKEND}/agent/chat", json=chat_payload)
         data = resp.json()
-
         answer = None
-        tool_calls = []
-        for choice in (data.get("choices") or []):
-            msg = choice.get("message", {})
-            if msg.get("content"):
-                answer = msg["content"]
-            for tc in (msg.get("tool_calls") or []):
-                tool_calls.append(tc)
-
-        if not tool_calls:
-            # Conversational: no state change
-            return {"answer": answer or "(no response)", "url": None, "masked": None}
-
-        # Execute tool calls sequentially
-        executed = []
-        for tc in tool_calls:
-            name = tc["function"]["name"]
-            args = json.loads(tc["function"]["arguments"] or "{}")
-            await client.post(f"{BACKEND}/tools/{name}", json=args)
-            executed.append(name)
-
-        # Fetch current masked link (no persistence) after mutations BEFORE closing client
-        link_resp = await client.post(f"{BACKEND}/tools/ng_state_link")
-        link_data = link_resp.json()
+        if data.get("choices"):
+            msg = data["choices"][0].get("message", {})
+            answer = msg.get("content")
+        mutated = bool(data.get("mutated"))
+        state_link = data.get("state_link") or {}
+        tool_trace = data.get("tool_trace") or []
         return {
-            "answer": answer,
-            "url": link_data.get("url"),
-            "masked": link_data.get("masked_markdown"),
-            "tools": executed,
+            "answer": answer or "(no response)",
+            "mutated": mutated,
+            "url": state_link.get("url"),
+            "masked": state_link.get("masked_markdown"),
+            "tool_trace": tool_trace,
         }
 
 def _mask_client_side(text: str) -> str:
@@ -120,74 +104,67 @@ def _mask_client_side(text: str) -> str:
 
 
 async def respond(contents: str, user: str, **kwargs):
-    global last_loaded_url
+    global last_loaded_url, _trace_history
     status.object = "Running…"
     try:
         result = await agent_call(contents)
         link = result.get("url")
-        executed = set(result.get("tools") or [])
-        mutated = bool(executed & MUTATING_TOOLS)
+        mutated = bool(result.get("mutated"))
         safe_answer = _mask_client_side(result.get("answer")) if result.get("answer") else None
+        trace = result.get("tool_trace") or []
+        if trace:
+            # Build concise status line of executed tool names in order
+            tool_names = [t.get("tool") or t.get("name") for t in trace if t]
+            if tool_names:
+                status.object = f"Tools: {' → '.join(tool_names)}"
 
-        if link:
-            latest_url.value = link or ""
+        # Optional trace history retrieval
+        if trace_history_checkbox.value:
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    hist_resp = await client.get(f"{BACKEND}/debug/tool_trace", params={"n": trace_history_length.value})
+                hist_data = hist_resp.json()
+                _trace_history = hist_data.get("traces", [])
+                if _trace_history:
+                    def _payload():
+                        payload = {
+                            "exported_at": datetime.utcnow().isoformat() + 'Z',
+                            "count": len(_trace_history),
+                            "traces": _trace_history,
+                        }
+                        return io.BytesIO(json.dumps(payload, indent=2).encode('utf-8'))
+                    trace_download.callback = _payload
+                    ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+                    trace_download.filename = f"trace_history_{ts}.json"
+                    trace_download.disabled = False
+            except Exception as e:  # pragma: no cover
+                status.object += f" | Trace err: {e}"
+
+        if mutated and link:
+            latest_url.value = link
             masked = result.get("masked") or f"[Updated Neuroglancer view]({link})"
-            if mutated:
-                if link != last_loaded_url:
-                    if auto_load_checkbox.value:
-                        viewer.url = link
-                        viewer._load_url()
-                        last_loaded_url = link
-                        status.object = f"**Opened:** {link}"
-                    else:
-                        status.object = "New link generated (auto-load off)."
+            if link != last_loaded_url:
+                if auto_load_checkbox.value:
+                    viewer.url = link
+                    viewer._load_url()
+                    last_loaded_url = link
+                    status.object = f"**Opened:** {link}"
                 else:
-                    status.object = "State updated (no link change)."
+                    status.object = "New link generated (auto-load off)."
             else:
-                status.object = "Completed (no view change)."
-
+                status.object = "State updated (no link change)."
             if safe_answer:
                 return f"{safe_answer}\n\n{masked}"
             return masked
         else:
-            status.object = "Done."
+            if not trace:
+                status.object = "Done (no view change)."
             return safe_answer if safe_answer else "(no response)"
     except Exception as e:
         status.object = f"Error: {e}"
         return f"Error: {e}"
-    
-# async def agent_call(prompt: str) -> str:
-#     """Send prompt to FastAPI agent, execute tool calls, return final NG state URL."""
-#     async with httpx.AsyncClient(timeout=60) as client:
-#         # 1) Ask the agent for tool calls
-#         chat = {"messages": [{"role": "user", "content": prompt}]}
-#         resp = await client.post(f"{BACKEND}/agent/chat", json=chat)
-#         data = resp.json()
 
-#         # 2) Execute tool calls
-#         for choice in (data.get("choices") or []):
-#             msg = choice.get("message", {})
-#             for tc in (msg.get("tool_calls") or []):
-#                 name = tc["function"]["name"]
-#                 args = json.loads(tc["function"]["arguments"] or "{}")
-#                 await client.post(f"{BACKEND}/tools/{name}", json=args)
-
-#         # 3) Save state and return URL
-#         save = await client.post(f"{BACKEND}/tools/state_save", json={})
-#         return save.json()["url"]
-
-# async def respond(contents: str, user: str, **kwargs):
-#     """Async callback works natively on Panel 1.7.5."""
-#     status.object = "Running…"
-#     try:
-#         url = await agent_call(contents)
-#         viewer.source = url
-#         status.object = f"**Opened:** {url}"
-#         return f"Updated Neuroglancer view.\n\n{url}"
-#     except Exception as e:
-#         status.object = f"Error: {e}"
-#         return f"Error: {e}"
-
+# ---------------- Chat UI ----------------
 chat = ChatInterface(
     user="User",
     avatar="👤",
@@ -195,65 +172,132 @@ chat = ChatInterface(
     show_activity_dot=True,
     callback=respond,         # async callback
     height=1000,
-    #buttons
     show_button_name=False,
-    # chat ui
     show_avatar=False,
     show_reaction_icons=False,
     show_copy_icon=False,
     show_timestamp=False,
     widgets=[
-        pn.chat.ChatAreaInput(placeholder="Enter some text to get a count!"),
-        pn.widgets.FileInput(name="CSV File", accept=".csv"),
+        pn.chat.ChatAreaInput(placeholder="Ask a question or issue a command..."),
     ],
-    # message styles
-    message_params={   
-         # .meta { display: none; }
-         #             .avatar { display: none; }
-         #center { min-height: 30px; background-color: lightgrey; }
-         #.left { width: 2px; height: 2px; }
-         #.avatar { width: 5px; height: 5px; min-width: 5px; min-height: 5px; }
-         #.right{ background-color: red; }
-         #.meta { display: none; height: 0px; }
+    message_params={
         "stylesheets": [
             """
             .message {
                 font-size: 1em;
-
                 padding: 4px;
             }
-            .name {
-                font-size: 0.9em;
-            }
-            .timestamp {
-                font-size: 0.9em;
-            }
-            
-            
+            .name { font-size: 0.9em; }
+            .timestamp { font-size: 0.9em; }
             """
         ]
      }
 )
 
+# ---------------- Settings UI ----------------
 settings_card = pn.Card(
-    pn.Column(auto_load_checkbox, latest_url, open_latest_btn, status),
+    pn.Column(auto_load_checkbox, latest_url, open_latest_btn, trace_history_checkbox, trace_history_length, trace_download, status),
     title="Settings",
     collapsed=False,
 )
 
+# ---------------- Data Upload & Summaries UI ----------------
+# NOTE: We keep upload + table refresh synchronous to avoid early event-loop timing issues
+# during Panel server warm start on some platforms (Windows). Async is still used for
+# LLM/chat + state sync, but simple data listing uses blocking httpx calls.
+file_drop = pn.widgets.FileDropper(name="Drop CSV files here", multiple=True, accepted_filetypes=["text/csv", ".csv"])
+upload_notice = pn.pane.Markdown("")
+try:
+    import pandas as pd
+except Exception:  # pragma: no cover
+    pd = None
+
+if pd is not None:
+    uploaded_table = pn.widgets.Tabulator(pd.DataFrame(columns=["file_id","name","size","n_rows","n_cols"]), height=210, disabled=True)
+    summaries_table = pn.widgets.Tabulator(pd.DataFrame(columns=["summary_id","source_file_id","kind","n_rows","n_cols"]), height=210, disabled=True)
+else:
+    uploaded_table = pn.pane.Markdown("pandas not available")
+    summaries_table = pn.pane.Markdown("pandas not available")
+
+def _refresh_files():
+    if pd is None:
+        return
+    try:
+        with httpx.Client(timeout=30) as client:
+            lst = client.post(f"{BACKEND}/tools/data_list_files")
+            data = lst.json().get("files", [])
+        if data:
+            uploaded_table.value = pd.DataFrame(data)
+        else:
+            uploaded_table.value = pd.DataFrame(columns=uploaded_table.value.columns)
+    except Exception as e:  # pragma: no cover
+        upload_notice.object = f"File list error: {e}"
+
+def _refresh_summaries():
+    if pd is None:
+        return
+    try:
+        with httpx.Client(timeout=30) as client:
+            lst = client.post(f"{BACKEND}/tools/data_list_summaries")
+            data = lst.json().get("summaries", [])
+        if data:
+            summaries_table.value = pd.DataFrame(data)
+        else:
+            summaries_table.value = pd.DataFrame(columns=summaries_table.value.columns)
+    except Exception as e:  # pragma: no cover
+        upload_notice.object = f"Summary list error: {e}"
+
+def _handle_file_upload(evt):
+    files = evt.new or {}
+    if not files:
+        return
+    msgs: list[str] = []
+    # FileDropper provides mapping name -> bytes
+    with httpx.Client(timeout=60) as client:
+        for name, raw in files.items():
+            try:
+                # Some widgets may give dicts with 'content' or 'body'
+                if isinstance(raw, dict):
+                    raw_bytes = raw.get("content") or raw.get("body") or b""
+                else:
+                    raw_bytes = raw
+                resp = client.post(
+                    f"{BACKEND}/upload_file",
+                    files={"file": (name, raw_bytes, "text/csv")},
+                )
+                rj = resp.json()
+                if rj.get("ok"):
+                    msgs.append(f"✅ {name} → {rj['file']['file_id']}")
+                else:
+                    msgs.append(f"❌ {name} error: {rj.get('error')}")
+            except Exception as e:  # pragma: no cover
+                msgs.append(f"❌ {name} exception: {e}")
+    upload_notice.object = "\n".join(msgs)
+    _refresh_files()
+    _refresh_summaries()
+
+file_drop.param.watch(_handle_file_upload, "value")
+
+def _initial_refresh():
+    _refresh_files()
+    _refresh_summaries()
 
 upload_card = pn.Card(
     pn.Column(
-        pn.widgets.FileInput(name="CSV File", accept=".csv"),
-        pn.widgets.Button(name="Upload", button_type="primary"),
+        file_drop,
+        upload_notice,
+        pn.pane.Markdown("**Uploaded Files**"),
+        uploaded_table,
+        pn.pane.Markdown("**Summaries**"),
+        summaries_table,
     ),
-    title="Upload",
-    collapsed=True,
-    # fill_space=True,
+    title="Data Upload & Summaries",
+    collapsed=False,
     width=450,
 )
 
-
+# ---------------- Assemble App ----------------
+# Main app with sidebar upload + chat, right sidebar settings, main viewer
 app = pn.template.FastListTemplate(
     title=f"Neurogabber v {version}",
     sidebar=[upload_card,chat],
@@ -265,3 +309,17 @@ app = pn.template.FastListTemplate(
 )
 
 app.servable()
+
+
+# prompt inject example
+# pn.state.onload(_initial_refresh)
+
+# prompt_btn = pn.widgets.Button(name="Draft prompt for first file", button_type="primary")
+
+# def _inject_prompt(_):
+#     if pd is None: return
+#     if hasattr(uploaded_table, 'value') and not uploaded_table.value.empty:
+#         fid = uploaded_table.value.iloc[0]["file_id"]
+#         chat.send(f"Preview file {fid}")
+
+# prompt_btn.on_click(_inject_prompt)

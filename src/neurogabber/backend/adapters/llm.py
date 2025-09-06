@@ -14,6 +14,8 @@ Decision rules:
 - After performing modifications, if the user requests a link or updated view, call ng_state_link (NOT state_save) to return a masked markdown hyperlink. Only call state_save when explicit persistence is requested (e.g. 'save', 'persist', 'store').
 - Do not paste raw Neuroglancer URLs directly; always rely on ng_state_link for sharing the current view.
 
+Dataframe rules:
+- If the user wants a random sample, assume no seed, without replacement, and uniforming across all rows. Unless otherwise specificed. 
 Keep answers concise. Provide brief rationale before tool calls when helpful. Avoid redundant summaries."""
 
 # Define available tools (schemas must match your Pydantic models)
@@ -110,11 +112,105 @@ TOOLS = [
   {"type":"function","function": {"name":"ng_state_link","description":"Return current state Neuroglancer link plus masked markdown hyperlink (use after modifications when user requests link).","parameters":{"type":"object","properties":{}}}}
 ]
 
+# Data tools appended
+DATA_TOOLS = [
+  {
+    "type": "function",
+    "function": {
+      "name": "data_list_files",
+      "description": "List uploaded CSV files with metadata (ids, columns).",
+      "parameters": {"type": "object", "properties": {}}
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "data_info",
+      "description": "Return dataframe metadata (rows, cols, columns, dtypes, head sample). Call before asking questions about the dataset.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file_id": {"type": "string"},
+          "sample_rows": {"type": "integer", "default": 5, "minimum": 1, "maximum": 20}
+        },
+        "required": ["file_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "data_preview",
+      "description": "Preview first N rows of a file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file_id": {"type": "string"},
+          "n": {"type": "integer", "default": 10, "minimum": 1, "maximum": 100}
+        },
+        "required": ["file_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "data_describe",
+      "description": "Compute numeric summary statistics for a file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file_id": {"type": "string"}
+        },
+        "required": ["file_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "data_select",
+      "description": "Select subset of columns and filtered rows; stores as summary table.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file_id": {"type": "string"},
+          "columns": {"type": "array", "items": {"type": "string"}},
+          "filters": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "column": {"type": "string"},
+                "op": {"type": "string", "enum": ["==","!=",">","<",">=","<="]},
+                "value": {}
+              },
+              "required": ["column", "op", "value"]
+            }
+          },
+          "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 500}
+        },
+        "required": ["file_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "data_list_summaries",
+      "description": "List previously created summary / derived tables.",
+      "parameters": {"type": "object", "properties": {}}
+    }
+  },
+]
+
+TOOLS = TOOLS + DATA_TOOLS
+
 
 def run_chat(messages: List[Dict]) -> Dict:
     resp = client.chat.completions.create(
         #model="gpt-4o-mini",  # any tool-capable model
-        model="gpt-5-mini",  # any tool-capable model
+        model="gpt-5",  # any tool-capable model
         messages=messages,
         tools=TOOLS,
         tool_choice="auto"
