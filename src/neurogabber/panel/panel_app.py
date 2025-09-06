@@ -202,7 +202,12 @@ chat = ChatInterface(
     show_reaction_icons=False,
     show_copy_icon=False,
     show_timestamp=False,
-     message_params={   
+    widgets=[
+        pn.chat.ChatAreaInput(placeholder="Enter some text to get a count!"),
+        pn.widgets.FileInput(name="CSV File", accept=".csv"),
+    ],
+    # message styles
+    message_params={   
          # .meta { display: none; }
          #             .avatar { display: none; }
          #center { min-height: 30px; background-color: lightgrey; }
@@ -236,9 +241,22 @@ settings_card = pn.Card(
     collapsed=False,
 )
 
+
+upload_card = pn.Card(
+    pn.Column(
+        pn.widgets.FileInput(name="CSV File", accept=".csv"),
+        pn.widgets.Button(name="Upload", button_type="primary"),
+    ),
+    title="Upload",
+    collapsed=True,
+    # fill_space=True,
+    width=450,
+)
+
+
 app = pn.template.FastListTemplate(
     title=f"Neurogabber v {version}",
-    sidebar=[chat],
+    sidebar=[upload_card,chat],
     right_sidebar=settings_card,
     collapsed_right_sidebar = True,
     main=[viewer],
