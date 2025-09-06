@@ -338,6 +338,8 @@ def _execute_tool_by_name(name: str, args: dict):
             return t_data_list_summaries()
         if name == "data_info":
             return t_data_info(**args)
+        if name == "data_sample":
+            return t_data_sample(**args)
     except Exception as e:  # pragma: no cover
         logger.exception("Tool execution error")
         return {"error": str(e)}
@@ -583,3 +585,40 @@ def t_data_select(
 @app.post("/tools/data_list_summaries")
 def t_data_list_summaries():
     return {"summaries": DATA_MEMORY.list_summaries()}
+
+
+@app.post("/tools/data_sample")
+def t_data_sample(
+    file_id: str = Body(..., embed=True),
+    n: int = Body(5, embed=True),
+    seed: int | None = Body(None, embed=True),
+    replace: bool = Body(False, embed=True),
+):
+    """Return a random sample of rows from a dataframe (without replacement by default).
+
+    Parameters:
+      file_id: ID of uploaded file
+      n: number of rows to sample (default 5, bounded 1..1000)
+      seed: optional integer seed for reproducibility (None => random)
+      replace: sample with replacement (default False)
+    """
+    try:
+        df = DATA_MEMORY.get_df(file_id)
+        n = max(1, min(n, 1000))
+        if not replace and n > df.height:
+            n = df.height
+        # polars sample: shuffle=True ensures random order even when n==height
+        sampled = df.sample(n=n, with_replacement=replace, shuffle=True, seed=seed)
+        return {
+            "file_id": file_id,
+            "requested": n,
+            "returned": sampled.height,
+            "with_replacement": replace,
+            "seed": seed,
+            "rows": sampled.to_dicts(),
+            "columns": sampled.columns,
+        }
+    except KeyError:
+        return {"error": f"Unknown file_id {file_id}"}
+    except Exception as e:
+        return {"error": str(e)}

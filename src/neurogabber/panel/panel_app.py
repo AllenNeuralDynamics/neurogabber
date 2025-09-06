@@ -29,6 +29,8 @@ trace_history_checkbox = pn.widgets.Checkbox(name="Trace history", value=False)
 trace_history_length = pn.widgets.IntInput(name="History N", value=5)
 trace_download = pn.widgets.FileDownload(label="Download traces", filename="trace_history.json", button_type="primary", disabled=True)
 _trace_history: list[dict] = []
+_recent_traces_view = pn.pane.Markdown("No traces yet.", sizing_mode="stretch_width")
+_recent_traces_accordion = pn.Accordion(("Recent Traces", _recent_traces_view), active=[])
 
 def _open_latest(_):
     if latest_url.value:
@@ -137,6 +139,20 @@ async def respond(contents: str, user: str, **kwargs):
                     ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
                     trace_download.filename = f"trace_history_{ts}.json"
                     trace_download.disabled = False
+                    # Update recent traces markdown (summaries only)
+                    lines: list[str] = []
+                    for i, t in enumerate(reversed(_trace_history), start=1):
+                        steps = t.get("steps", [])
+                        tool_chain = " → ".join(s.get("tool") for s in steps if s.get("tool"))
+                        mutated_flag = "✅" if t.get("mutated") else "–"
+                        final_msg = (t.get("final_message", {}).get("content") or "").strip()
+                        final_msg = final_msg[:120] + ("…" if len(final_msg) > 120 else "")
+                        lines.append(f"**{i}.** {mutated_flag} {tool_chain or '(no tools)'}\n> {final_msg}")
+                    if lines:
+                        _recent_traces_view.object = "\n\n".join(lines)
+                        _recent_traces_accordion.active = [0]
+                    else:
+                        _recent_traces_view.object = "No traces yet."
             except Exception as e:  # pragma: no cover
                 status.object += f" | Trace err: {e}"
 
@@ -196,7 +212,7 @@ chat = ChatInterface(
 
 # ---------------- Settings UI ----------------
 settings_card = pn.Card(
-    pn.Column(auto_load_checkbox, latest_url, open_latest_btn, trace_history_checkbox, trace_history_length, trace_download, status),
+    pn.Column(auto_load_checkbox, latest_url, open_latest_btn, trace_history_checkbox, trace_history_length, trace_download, _recent_traces_accordion, status),
     title="Settings",
     collapsed=False,
 )

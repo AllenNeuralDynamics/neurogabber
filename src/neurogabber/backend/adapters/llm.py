@@ -125,6 +125,23 @@ DATA_TOOLS = [
   {
     "type": "function",
     "function": {
+      "name": "data_sample",
+      "description": "Return a random sample of rows from a dataframe (without replacement by default). Use to inspect a subset before analysis.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file_id": {"type": "string"},
+          "n": {"type": "integer", "default": 5, "minimum": 1, "maximum": 1000},
+          "seed": {"type": ["integer", "null"], "description": "Optional seed for reproducibility"},
+          "replace": {"type": "boolean", "default": False}
+        },
+        "required": ["file_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "data_info",
       "description": "Return dataframe metadata (rows, cols, columns, dtypes, head sample). Call before asking questions about the dataset.",
       "parameters": {

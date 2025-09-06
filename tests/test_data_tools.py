@@ -45,3 +45,18 @@ def test_list_summaries():
     # Ensure at least one summary from previous tests
     resp = client.post("/tools/data_list_summaries").json()
     assert "summaries" in resp
+
+
+def test_data_sample_basic_and_seed():
+    resp = client.post("/upload_file", files={"file": ("sample.csv", CSV_CONTENT, "text/csv")}).json()
+    fid = resp["file"]["file_id"]
+    sample = client.post("/tools/data_sample", json={"file_id": fid, "n": 2}).json()
+    assert sample["returned"] == 2
+    assert len(sample["rows"]) == 2
+    # Seeded reproducibility
+    s1 = client.post("/tools/data_sample", json={"file_id": fid, "n": 2, "seed": 42}).json()
+    s2 = client.post("/tools/data_sample", json={"file_id": fid, "n": 2, "seed": 42}).json()
+    assert s1["rows"] == s2["rows"], "Seeded samples should match"
+    # Without replacement uniqueness
+    ids = [r["id"] for r in sample["rows"]]
+    assert len(ids) == len(set(ids))
