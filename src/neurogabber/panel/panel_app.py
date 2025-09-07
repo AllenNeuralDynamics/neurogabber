@@ -5,14 +5,29 @@ from panel_neuroglancer import Neuroglancer
 import polars as pl
 import pandas as pd
 
+# setup debug logging
+import logging
+FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+def reconfig_basic_config(format_=FORMAT, level=logging.INFO):
+    """(Re-)configure logging"""
+    logging.basicConfig(format=format_, level=level, force=True)
+    logging.info("Logging.basicConfig completed successfully")
+
+reconfig_basic_config()
+logger = logging.getLogger(name="app")
+
 # get version from package metadata init
 from importlib.metadata import version
 version = version("neurogabber")
-pn.config.theme = 'dark'
-pn.extension()  # enable the neuroglancer extension
-pn.extension(theme='dark')
-pn.extension('tabulator')
-pn.extension('filedropper')
+pn.extension(
+    'tabulator',
+    'filedropper',
+    'floatpanel',
+    theme='dark',
+    css_files=[
+        "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css"
+    ],
+)
 
 BACKEND = os.environ.get("BACKEND", "http://127.0.0.1:8000")
 
@@ -328,6 +343,9 @@ if pd is not None:
         height=0,  # start collapsed until data present
         disabled=True,
         show_index=False,
+        buttons={
+            'preview': "<i class='fa fa-eye' title='Preview file'></i>",
+        },
     )
     summaries_table = pn.widgets.Tabulator(
         pd.DataFrame(columns=["summary_id","source_file_id","kind","n_rows","n_cols"]),
@@ -465,10 +483,10 @@ upload_card = pn.Card(
     pn.Column(
         file_drop,
         upload_notice,
-        pn.pane.Markdown("**Uploaded Files**"),
+        #pn.pane.Markdown("**Uploaded Files**"),
         uploaded_table,
-        pn.pane.Markdown("**Summaries**"),
-        summaries_table,
+        #pn.pane.Markdown("**Summaries**"),
+        #summaries_table,
     ),
     title="Data Upload",
     collapsed=False,
@@ -478,9 +496,7 @@ upload_card = pn.Card(
 # Initialize title with zero count until first refresh occurs
 _update_upload_card_title(0)
 
-# ---------------- Assemble App ----------------
-# Main app with sidebar upload + chat, right sidebar settings, main viewer
-# Workspace card (initially collapsed) to host future workspace/status info
+
 workspace_body = pn.Column(
     pn.pane.Markdown("### Workspace\n_Add notes, context, or future controls here._"),
     sizing_mode="stretch_width",
