@@ -189,15 +189,29 @@ async def respond(contents: str, user: str, **kwargs):
             import pandas as pd
             df_rows = []
             for r in rows:
-                display = {k: v for k, v in r.items() if k not in ("link",)}
-                display["_raw_link"] = r.get("link")
+                display = {k: v for k, v in r.items() if k not in ("link", "masked_link")}
+                raw = r.get("link")
+                # Provide a simple HTML anchor; Tabulator with html=True will render it.
+                if raw:
+                    display["view"] = f"<a href='{raw}' target='_blank'>link</a>"
                 df_rows.append(display)
             if df_rows:
                 views_table.value = pd.DataFrame(df_rows)
                 views_table.visible = True
                 views_table.disabled = False
+                # Configure columns (if available) to allow HTML rendering
+                try:
+                    views_table.formatters = {"view": {"type": "html"}}
+                except Exception:
+                    pass
                 # Create a lightweight embedded table (copy) for chat message rendering
-                embedded_table_component = pn.widgets.Tabulator(views_table.value.copy(), height=220, disabled=True, selectable=False, pagination=None)
+                embedded_table_component = pn.widgets.Tabulator(
+                    views_table.value.copy(), height=220, disabled=True, selectable=False, pagination=None
+                )
+                try:
+                    embedded_table_component.formatters = {"view": {"type": "html"}}
+                except Exception:
+                    pass
                 # Add click behavior: when selecting a row, open link
                 def _on_select(event):  # pragma: no cover UI callback
                     if not ng_links_internal.value:
@@ -207,8 +221,14 @@ async def respond(contents: str, user: str, **kwargs):
                         if data is not None and hasattr(data, "index") and len(data.index) > 0 and event.new:
                             idxs = event.new
                             if isinstance(idxs, list) and idxs:
-                                raw = data.iloc[idxs[0]].get("_raw_link")
-                                _load_internal_link(raw)
+                                # Reconstruct raw link from view cell href if needed
+                                href = data.iloc[idxs[0]].get("view")
+                                if isinstance(href, str) and "href='" in href:
+                                    try:
+                                        raw_link = href.split("href='",1)[1].split("'",1)[0]
+                                        _load_internal_link(raw_link)
+                                    except Exception:
+                                        pass
                     except Exception:
                         pass
                 global _views_table_watcher_added
