@@ -62,6 +62,9 @@ uv sync
 * Full Neuroglancer state retention (layers, transforms, shader controls, layout) with deterministic URL round‑trip
 * Optional auto-load toggle for applying newly generated Neuroglancer views
 * `data_info` tool for dataframe metadata (shape, columns, dtypes, sample rows)
+* `data_sample` tool for quick unbiased random row sampling (optional seed)
+* `data_ng_views_table` tool to generate ranked multi-view Neuroglancer links (top N by a metric)
+* Tool execution trace returned with each chat + debug endpoint for recent full traces
 
 ## Neuroglancer State Handling
 
@@ -72,3 +75,17 @@ Serialization (`state_save`) uses deterministic JSON ordering so round‑trip te
 ## Auto‑Load Toggle
 
 In the Panel UI a Settings card provides an "Auto-load view" checkbox (default ON). When disabled, generated URLs are shown in chat and placed in a read‑only "Latest NG URL" field; click "Open latest link" to manually apply. This affords manual inspection or batching of tool operations before updating the viewer.
+
+## Sampling & Multi-View Workflow
+
+Common exploration pattern:
+1. Upload CSV of ROIs / detections.
+2. Ask: "Show me a random sample of 5 rows from file XYZ" -> invokes `data_sample`.
+3. Ask: "Create Neuroglancer views for the top 8 by mean_intensity" -> model calls `data_ng_views_table` with `sort_by=mean_intensity` and `top_n=8`.
+4. Panel displays a table of rows (id + metric + masked link); the first view auto-loads (if enabled). Clicking other rows navigates without requiring new LLM calls.
+
+`data_ng_views_table` returns both raw `link` and `masked_link` so advanced clients can decide how to render. A summary table (kind `ng_views`) is stored allowing follow-up queries like: "Filter the previous views summary where mean_intensity > 0.8 then regenerate views".
+
+## Tool Trace
+
+Each chat response includes a concise `tool_trace` listing executed tools, argument keys, and result keys. For deeper debugging hit `/debug/tool_trace?n=5` to retrieve recent full traces (in-memory, bounded). This aids reproducibility and performance analysis without inflating LLM context.

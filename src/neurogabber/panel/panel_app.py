@@ -2,6 +2,8 @@ import os, json, httpx, asyncio, re, panel as pn, io
 from datetime import datetime
 from panel.chat import ChatInterface
 from panel_neuroglancer import Neuroglancer
+import polars as pl
+import pandas as pd
 
 # get version from package metadata init
 from importlib.metadata import version
@@ -25,12 +27,19 @@ last_loaded_url: str | None = None
 # Settings widgets
 auto_load_checkbox = pn.widgets.Checkbox(name="Auto-load view", value=True)
 latest_url = pn.widgets.TextInput(name="Latest NG URL", value="", disabled=True)
-trace_history_checkbox = pn.widgets.Checkbox(name="Trace history", value=False)
+trace_history_checkbox = pn.widgets.Checkbox(name="Trace history", value=True)
 trace_history_length = pn.widgets.IntInput(name="History N", value=5)
 trace_download = pn.widgets.FileDownload(label="Download traces", filename="trace_history.json", button_type="primary", disabled=True)
 _trace_history: list[dict] = []
 _recent_traces_view = pn.pane.Markdown("No traces yet.", sizing_mode="stretch_width")
 _recent_traces_accordion = pn.Accordion(("Recent Traces", _recent_traces_view), active=[])
+ng_links_internal = pn.widgets.Checkbox(name="NG links open internal", value=True)
+views_table = pn.widgets.Tabulator(pd.DataFrame(), disabled=True, height=250, visible=False)
+# NOTE: Tabulator expects a pandas.DataFrame. Do NOT pass a polars DataFrame or a class placeholder.
+# Always convert upstream objects (lists of dicts, polars.DataFrame) to pandas before assignment.
+
+# Track whether we've already added the row selection watcher to avoid inspecting internal watcher structures.
+_views_table_watcher_added = False
 
 def _open_latest(_):
     if latest_url.value:
@@ -87,6 +96,7 @@ async def agent_call(prompt: str) -> dict:
             "url": state_link.get("url"),
             "masked": state_link.get("masked_markdown"),
             "tool_trace": tool_trace,
+            "views_table": data.get("views_table"),
         }
 
 def _mask_client_side(text: str) -> str:
@@ -105,6 +115,13 @@ def _mask_client_side(text: str) -> str:
     return url_pattern.sub(repl, text)
 
 
+def _load_internal_link(url: str):
+    if not url:
+        return
+    viewer.url = url
+    viewer._load_url()
+    asyncio.create_task(_notify_backend_state_load(url))
+
 async def respond(contents: str, user: str, **kwargs):
     global last_loaded_url, _trace_history
     status.object = "Running…"
@@ -114,6 +131,7 @@ async def respond(contents: str, user: str, **kwargs):
         mutated = bool(result.get("mutated"))
         safe_answer = _mask_client_side(result.get("answer")) if result.get("answer") else None
         trace = result.get("tool_trace") or []
+        vt = result.get("views_table")
         if trace:
             # Build concise status line of executed tool names in order
             tool_names = [t.get("tool") or t.get("name") for t in trace if t]
@@ -156,7 +174,56 @@ async def respond(contents: str, user: str, **kwargs):
             except Exception as e:  # pragma: no cover
                 status.object += f" | Trace err: {e}"
 
-        if mutated and link:
+        # Render multi-view table if present
+        # If multi-view tool returned an error, surface it clearly (and any warnings)
+        if vt and isinstance(vt, dict) and vt.get("error"):
+            warn_txt = ""
+            if vt.get("warnings"):
+                warn_txt = "\n\nWarnings:\n- " + "\n- ".join(vt.get("warnings") or [])
+            status.object = f"Multi-view error: {vt.get('error')}{warn_txt}"
+        embedded_table_component = None
+        # Render multi-view table if present and successful
+        if vt and isinstance(vt, dict) and vt.get("rows"):
+            rows = vt["rows"]
+            # Build DataFrame-like structure for Tabulator. Hide raw link column, show masked_link clickable.
+            import pandas as pd
+            df_rows = []
+            for r in rows:
+                display = {k: v for k, v in r.items() if k not in ("link",)}
+                display["_raw_link"] = r.get("link")
+                df_rows.append(display)
+            if df_rows:
+                views_table.value = pd.DataFrame(df_rows)
+                views_table.visible = True
+                views_table.disabled = False
+                # Create a lightweight embedded table (copy) for chat message rendering
+                embedded_table_component = pn.widgets.Tabulator(views_table.value.copy(), height=220, disabled=True, selectable=False, pagination=None)
+                # Add click behavior: when selecting a row, open link
+                def _on_select(event):  # pragma: no cover UI callback
+                    if not ng_links_internal.value:
+                        return
+                    try:
+                        data = views_table.value
+                        if data is not None and hasattr(data, "index") and len(data.index) > 0 and event.new:
+                            idxs = event.new
+                            if isinstance(idxs, list) and idxs:
+                                raw = data.iloc[idxs[0]].get("_raw_link")
+                                _load_internal_link(raw)
+                    except Exception:
+                        pass
+                global _views_table_watcher_added
+                if not _views_table_watcher_added:
+                    try:
+                        views_table.param.watch(_on_select, 'selection')
+                        _views_table_watcher_added = True
+                    except Exception:
+                        # Fallback: silently ignore if watcher cannot be set (should not happen normally)
+                        pass
+            # Auto-load first link if auto-load enabled
+            if ng_links_internal.value and auto_load_checkbox.value and rows:
+                _load_internal_link(rows[0].get("link"))
+
+        if mutated and link and not vt:  # avoid duplicate load after views_table logic
             latest_url.value = link
             masked = result.get("masked") or f"[Updated Neuroglancer view]({link})"
             if link != last_loaded_url:
@@ -175,6 +242,12 @@ async def respond(contents: str, user: str, **kwargs):
         else:
             if not trace:
                 status.object = "Done (no view change)."
+            # If we have an embedded table, return a structured chat message containing both text & component
+            if embedded_table_component is not None:
+                # Wrap answer + table in a single Column so ChatInterface doesn't display list repr.
+                if safe_answer:
+                    return pn.Column(pn.pane.Markdown(safe_answer), embedded_table_component, sizing_mode="stretch_width")
+                return pn.Column(embedded_table_component, sizing_mode="stretch_width")
             return safe_answer if safe_answer else "(no response)"
     except Exception as e:
         status.object = f"Error: {e}"
@@ -212,7 +285,7 @@ chat = ChatInterface(
 
 # ---------------- Settings UI ----------------
 settings_card = pn.Card(
-    pn.Column(auto_load_checkbox, latest_url, open_latest_btn, trace_history_checkbox, trace_history_length, trace_download, _recent_traces_accordion, status),
+    pn.Column(auto_load_checkbox, latest_url, open_latest_btn, ng_links_internal, trace_history_checkbox, trace_history_length, trace_download, _recent_traces_accordion, status),
     title="Settings",
     collapsed=False,
 )
@@ -316,7 +389,7 @@ upload_card = pn.Card(
 # Main app with sidebar upload + chat, right sidebar settings, main viewer
 app = pn.template.FastListTemplate(
     title=f"Neurogabber v {version}",
-    sidebar=[upload_card,chat],
+    sidebar=[upload_card,chat, views_table],
     right_sidebar=settings_card,
     collapsed_right_sidebar = True,
     main=[viewer],

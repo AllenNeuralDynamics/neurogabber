@@ -142,6 +142,31 @@ DATA_TOOLS = [
   {
     "type": "function",
     "function": {
+      "name": "data_ng_views_table",
+      "description": "Generate multiple Neuroglancer view links from a dataframe (e.g., top N by a metric) returning a table of id + metrics + links. Mutates state to first view.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file_id": {"type": "string", "description": "Source file id (provide either file_id OR summary_id)"},
+          "summary_id": {"type": "string", "description": "Existing summary/derived table id (mutually exclusive with file_id)"},
+          "sort_by": {"type": "string"},
+          "descending": {"type": "boolean", "default": True},
+          "top_n": {"type": "integer", "default": 5, "minimum": 1, "maximum": 50},
+          "id_column": {"type": "string", "default": "cell_id"},
+          "center_columns": {"type": "array", "items": {"type": "string"}, "default": ["x","y","z"]},
+          "include_columns": {"type": "array", "items": {"type": "string"}},
+          "lut": {"type": "object", "properties": {"layer": {"type": "string"}, "min": {"type": "number"}, "max": {"type": "number"}}},
+          "annotations": {"type": "boolean", "default": False},
+          "link_label_column": {"type": "string"}
+        },
+        # Note: cannot express mutual exclusivity without oneOf (disallowed by OpenAI);
+        # model should infer to supply only one of file_id or summary_id.
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "data_info",
       "description": "Return dataframe metadata (rows, cols, columns, dtypes, head sample). Call before asking questions about the dataset.",
       "parameters": {
@@ -227,7 +252,7 @@ TOOLS = TOOLS + DATA_TOOLS
 def run_chat(messages: List[Dict]) -> Dict:
     resp = client.chat.completions.create(
         #model="gpt-4o-mini",  # any tool-capable model
-        model="gpt-5",  # any tool-capable model
+        model="gpt-5-mini",  # any tool-capable model
         messages=messages,
         tools=TOOLS,
         tool_choice="auto"

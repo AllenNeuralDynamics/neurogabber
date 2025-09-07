@@ -1,4 +1,5 @@
 import os
+import re
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -19,6 +20,16 @@ import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Enable verbose debug logging when NEUROGABBER_DEBUG is set (1/true/yes)
+DEBUG_ENABLED = os.getenv("NEUROGABBER_DEBUG", "").lower() in ("1", "true", "yes")
+
+def _dbg(msg: str):  # lightweight wrapper to centralize debug guard
+    if DEBUG_ENABLED:
+        try:
+            logger.info(f"[DBG] {msg}")
+        except Exception:
+            pass
 
 app = FastAPI()
 
@@ -172,15 +183,22 @@ def chat(req: ChatRequest):
     overall_mutated = False
     tool_execution_records = []  # truncated records for response
     full_trace_steps = []  # full detail trace retained server-side
+    aggregated_views_table = None
 
     for iteration in range(max_iters):
+        _dbg(f"Iteration {iteration} start; messages so far={len(conversation)}")
         out = run_chat(conversation)
         choices = out.get("choices") or []
         if not choices:
+            _dbg("No choices returned by model; breaking loop")
             break
         msg = choices[0].get("message") or {}
         tool_calls = msg.get("tool_calls") or []
         content = msg.get("content")
+        if tool_calls:
+            _dbg("Model tool_calls=" + ", ".join([(tc.get('function') or {}).get('name','?') for tc in tool_calls]))
+        else:
+            _dbg("Model returned no tool_calls; finishing")
         # If there are no tool calls we're done
         if not tool_calls:
             # Final masking before return
@@ -203,7 +221,28 @@ def chat(req: ChatRequest):
                 args = _json.loads(raw_args)
             except Exception:
                 args = {}
+            _dbg(f"Executing tool '{fn}' args={args}")
             result_payload = _execute_tool_by_name(fn, args)
+            _dbg(f"Tool '{fn}' result keys={list(result_payload.keys())}")
+            if fn == "data_ng_views_table" and isinstance(result_payload, dict):
+                if "error" in result_payload and "rows" not in result_payload:
+                    # Surface error to client (Option A) & log details (Option C)
+                    trace_snip = None
+                    if isinstance(result_payload.get("trace"), str):
+                        trace_snip = result_payload["trace"][:400]
+                    aggregated_views_table = {
+                        "error": result_payload.get("error"),
+                        "trace_snip": trace_snip,
+                        "args": args,
+                        # Surface warnings (new) so user sees per-row issues like missing coords
+                        "warnings": result_payload.get("warnings"),
+                    }
+                    _dbg(f"views_table error surfaced error='{result_payload.get('error')}' trace_snip_len={len(trace_snip) if trace_snip else 0}")
+                else:
+                    aggregated_views_table = {
+                        k: v for k, v in result_payload.items() if k in {"file_id","summary","n","rows","warnings","first_link"}
+                    }
+                    _dbg(f"Aggregated views_table set; keys={list(aggregated_views_table.keys()) if aggregated_views_table else None}; rows_len={len((aggregated_views_table or {}).get('rows',[]))}")
             if is_mutating_tool(fn):
                 overall_mutated = True
             # Truncate large structures for token safety
@@ -270,14 +309,25 @@ def chat(req: ChatRequest):
     except Exception:  # pragma: no cover
         logger.exception("Failed storing trace history")
 
-    return {
+    # If multi-view tool ran, override state_link with its first_link for continuity
+    if aggregated_views_table and aggregated_views_table.get("first_link") and state_link_block is None:
+        try:
+            first_url = aggregated_views_table["first_link"]
+            state_link_block = {"url": first_url, "masked_markdown": _mask_ng_urls(first_url)}
+        except Exception:
+            pass
+
+    final_payload = {
         "model": "iterative",
         "choices": [{"index": 0, "message": final_assistant, "finish_reason": "stop"}],
         "usage": {},
         "mutated": overall_mutated,
         "state_link": state_link_block,
         "tool_trace": tool_execution_records,
+        "views_table": aggregated_views_table,
     }
+    _dbg(f"Returning payload mutated={overall_mutated} state_link?={bool(state_link_block)} views_table_rows={len((aggregated_views_table or {}).get('rows', [])) if aggregated_views_table else 0}")
+    return final_payload
 
 
 @app.get("/debug/tool_trace")
@@ -340,6 +390,8 @@ def _execute_tool_by_name(name: str, args: dict):
             return t_data_info(**args)
         if name == "data_sample":
             return t_data_sample(**args)
+        if name == "data_ng_views_table":
+            return t_data_ng_views_table(**args)
     except Exception as e:  # pragma: no cover
         logger.exception("Tool execution error")
         return {"error": str(e)}
@@ -622,3 +674,169 @@ def t_data_sample(
         return {"error": f"Unknown file_id {file_id}"}
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.post("/tools/data_ng_views_table")
+def t_data_ng_views_table(
+    file_id: str | None = Body(None, embed=True),
+    summary_id: str | None = Body(None, embed=True),
+    sort_by: str | None = Body(None, embed=True),
+    descending: bool = Body(True, embed=True),
+    top_n: int = Body(5, embed=True),
+    id_column: str = Body("cell_id", embed=True),
+    center_columns: list[str] = Body(["x","y","z"], embed=True),
+    include_columns: list[str] | None = Body(None, embed=True),
+    lut: dict | None = Body(None, embed=True),
+    annotations: bool = Body(False, embed=True),
+    link_label_column: str | None = Body(None, embed=True),
+):
+    """Generate multiple Neuroglancer view links (not persisted) and return a table.
+
+    Strategy: mutate state sequentially but finalize CURRENT_STATE to the FIRST view
+    for user continuity. Returns table rows with raw + masked links and stores a
+    summary table in DataMemory (kind='ng_views').
+    """
+    from copy import deepcopy
+    global CURRENT_STATE
+    warnings: list[str] = []
+    # Defensive: the default FastAPI Body(...) object (FieldInfo) is bound when we call this function directly.
+    # We do NOT want to stringify it (that produced spurious 'Unknown summary_id: annotation=...' errors).
+    from fastapi import params as _fastapi_params  # type: ignore
+    # Treat any non-string or FieldInfo-derived object as None.
+    if not isinstance(file_id, str) or isinstance(file_id, _fastapi_params.Body):
+        file_id = None
+    if not isinstance(summary_id, str) or isinstance(summary_id, _fastapi_params.Body) or (
+        isinstance(summary_id, str) and "alias='summary_id'" in summary_id
+    ):
+        summary_id = None
+    # Sanitize other params that may still be FastAPI Body objects when internal dispatcher bypasses validation
+    if isinstance(lut, _fastapi_params.Body):
+        lut = None
+    if isinstance(include_columns, _fastapi_params.Body):
+        include_columns = None
+    if isinstance(center_columns, _fastapi_params.Body) or not isinstance(center_columns, (list, tuple)):
+        center_columns = ["x","y","z"]
+    if isinstance(id_column, _fastapi_params.Body) or not isinstance(id_column, str):
+        id_column = "cell_id"
+    if isinstance(link_label_column, _fastapi_params.Body):
+        link_label_column = None
+    if isinstance(sort_by, _fastapi_params.Body):
+        sort_by = None
+    if isinstance(descending, _fastapi_params.Body):
+        descending = True
+    if isinstance(top_n, _fastapi_params.Body):
+        top_n = 5
+    if isinstance(annotations, _fastapi_params.Body):
+        annotations = False
+    if DEBUG_ENABLED:
+        _dbg(f"Normalized ids -> file_id={file_id} summary_id={summary_id}")
+        _dbg(
+            "Sanitized params types: "
+            f"sort_by={type(sort_by).__name__} descending={type(descending).__name__} top_n={type(top_n).__name__} "
+            f"id_column={type(id_column).__name__} center_columns={type(center_columns).__name__} include_columns={type(include_columns).__name__} "
+            f"lut={type(lut).__name__} annotations={type(annotations).__name__} link_label_column={type(link_label_column).__name__}"
+        )
+    if not file_id and not summary_id:
+        return {"error": "Must provide file_id or summary_id"}
+    try:
+        if file_id and summary_id:
+            warnings.append("Both file_id and summary_id provided; using summary_id")
+        if summary_id:
+            df = DATA_MEMORY.get_summary_df(summary_id)
+            source_fid = DATA_MEMORY.get_summary_record(summary_id).source_file_id
+        else:
+            df = DATA_MEMORY.get_df(file_id)  # type: ignore[arg-type]
+            source_fid = file_id  # type: ignore[assignment]
+        top_n = max(1, min(top_n, 50))
+        cols_needed = set([id_column, *center_columns])
+        missing = [c for c in cols_needed if c not in df.columns]
+        if missing:
+            return {"error": f"Missing required columns: {missing}"}
+        work_df = df
+        if sort_by:
+            if sort_by not in df.columns:
+                return {"error": f"sort_by column '{sort_by}' not found", "available_columns": df.columns}
+            work_df = df.sort(sort_by, descending=descending)
+        subset = work_df.head(top_n)
+        if DEBUG_ENABLED:
+            _dbg(f"views_table subset height={subset.height} top_n={top_n} sort_by={sort_by} descending={descending}")
+            if subset.height:
+                # Log first row preview (selected key columns only)
+                fr = subset.head(1).to_dicts()[0]
+                preview_keys = [id_column, *center_columns]
+                preview = {k: fr.get(k) for k in preview_keys if k in fr}
+                _dbg(f"views_table first_row_preview={preview}")
+        include_columns = include_columns or []
+        missing_includes = [c for c in include_columns if c not in df.columns]
+        if missing_includes:
+            warnings.append(f"Ignored missing include columns: {missing_includes}")
+            include_columns = [c for c in include_columns if c in df.columns]
+
+        rows = []
+        first_state = None
+        # We'll generate links from ephemeral mutated copies; not persisting with save_state
+        for idx, row in enumerate(subset.to_dicts()):
+            # mutate copy of CURRENT_STATE
+            state_copy = deepcopy(CURRENT_STATE)
+            try:
+                # set view center; reuse internal set_view logic
+                cx, cy, cz = (row[center_columns[0]], row[center_columns[1]], row[center_columns[2]])
+                state_copy = _set_view(state_copy, {"x": cx, "y": cy, "z": cz}, None, None)
+                # LUT optionally
+                if lut and lut.get("layer") and "min" in lut and "max" in lut:
+                    state_copy = _set_lut(state_copy, lut["layer"], lut.get("min"), lut.get("max"))
+                # annotation optionally
+                if annotations:
+                    ann_items = [
+                        {"point": [cx, cy, cz], "id": str(row.get(id_column, idx))}
+                    ]
+                    state_copy = _add_ann(state_copy, "annotations", ann_items)
+                link_url = to_url(state_copy)
+                masked = _mask_ng_urls(link_url)
+                if masked == link_url:
+                    masked = f"[link]({link_url})"
+                else:
+                    # Replace default label text with simple 'link'
+                    masked = re.sub(r"\[(Updated Neuroglancer view(?: \(\d+\))?)\]", "[link]", masked)
+                record = {
+                    id_column: row.get(id_column),
+                    "link": link_url,
+                    "masked_link": masked,
+                }
+                for c in include_columns:
+                    record[c] = row.get(c)
+                if link_label_column and link_label_column in row:
+                    record["label"] = row[link_label_column]
+                rows.append(record)
+                if first_state is None:
+                    first_state = state_copy
+                if DEBUG_ENABLED:
+                    _dbg(f"views_table row {idx} processed id={record.get(id_column)}")
+            except Exception as e:  # pragma: no cover
+                warnings.append(f"Row {idx} error: {e}")
+                if DEBUG_ENABLED:
+                    _dbg(f"views_table row {idx} exception: {e}")
+                continue
+        if not rows:
+            if DEBUG_ENABLED:
+                _dbg(f"views_table abort: 0 rows succeeded; warnings_count={len(warnings)}")
+            return {"error": "No rows processed", "warnings": warnings}
+        # finalize CURRENT_STATE to first view state
+        if first_state is not None:
+            CURRENT_STATE = first_state
+        # Build summary dataframe (exclude raw link?) keep masked link + metrics
+        table_df = pl.DataFrame([
+            {k: v for k, v in r.items() if k != "link"} for r in rows
+        ])
+        meta = DATA_MEMORY.add_summary(source_fid, "ng_views", table_df, note="multi-view table")
+        return {
+            "file_id": source_fid,
+            "summary": meta,
+            "n": len(rows),
+            "rows": rows,
+            "warnings": warnings,
+            "first_link": rows[0]["link"],
+        }
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "trace": traceback.format_exc()}

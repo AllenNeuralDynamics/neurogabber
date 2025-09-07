@@ -94,6 +94,11 @@ class DataMemory:
             raise KeyError(f"Unknown summary_id: {summary_id}")
         return self.summaries[summary_id].df
 
+    def get_summary_record(self, summary_id: str) -> SummaryRecord:
+        if summary_id not in self.summaries:
+            raise KeyError(f"Unknown summary_id: {summary_id}")
+        return self.summaries[summary_id]
+
 
 class InteractionMemory:
     """Simple rolling memory for recent interactions."""

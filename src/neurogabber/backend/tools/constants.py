@@ -12,6 +12,7 @@ MUTATING_TOOLS: set[str] = {
     "ng_annotations_add",
     "state_load",            # replaces entire state
     "data_ingest_csv_rois",  # may add an annotation layer
+    "data_ng_views_table",   # generates multiple view mutations
 }
 
 

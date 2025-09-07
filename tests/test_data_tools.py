@@ -60,3 +60,21 @@ def test_data_sample_basic_and_seed():
     # Without replacement uniqueness
     ids = [r["id"] for r in sample["rows"]]
     assert len(ids) == len(set(ids))
+
+
+def test_data_ng_views_table_basic():
+    # Build a dataframe with required columns
+    content = b"cell_id,x,y,z,mean_intensity\n1,10,20,30,5.5\n2,11,21,31,6.5\n3,12,22,32,7.5\n"
+    resp = client.post("/upload_file", files={"file": ("cells.csv", content, "text/csv")}).json()
+    fid = resp["file"]["file_id"]
+    mv = client.post("/tools/data_ng_views_table", json={
+        "file_id": fid,
+        "sort_by": "mean_intensity",
+        "top_n": 2,
+        "include_columns": ["mean_intensity"],
+    }).json()
+    assert mv.get("n") == 2, mv
+    assert mv["rows"][0]["cell_id"] in (1,2,3)
+    assert "link" in mv["rows"][0]
+    assert mv.get("first_link") == mv["rows"][0]["link"], mv
+    assert "summary" in mv, mv

@@ -149,6 +149,9 @@ Data (Polars):
 * Server-side orchestration of multi-step tool calls + conditional NG auto-load.
 * `data_info` tool for quick dataframe metadata used in reasoning.
 * Masking of raw Neuroglancer URLs (backend + frontend fallback).
+* Tool execution trace (`tool_trace`) in chat response plus `/debug/tool_trace` for recent full traces.
+* Random row sampling via `data_sample` (deterministic with optional seed, without replacement by default).
+* Multi‑view generation via `data_ng_views_table` returning a table of ranked rows with per‑row NG links and auto‑loading the first view.
 
 ## Planned (near‑term)
 * Real CloudVolume sampling (ROI support, multiscale) + caching.
@@ -159,6 +162,64 @@ Data (Polars):
 * Additional data tools: joins, stratified sampling, per-column value counts.
 * Observability: tracing (OTel / Langfuse), structured tool logs, rate limits.
 * Memory summarization / condensation (semantic compression) for long chats.
+* Richer multi‑view workflows (pagination, client-side filtering, per-row annotation overlays).
+* Row-level warning surfacing in UI for partial failures during multi-view generation.
+
+## Tool Trace & Observability
+
+Each `/agent/chat` response includes a lightweight `tool_trace` array showing executed tools, truncated arguments, and top-level result keys. Full (untruncated) details for the last N (default 50) interactions are stored in-memory and available at `/debug/tool_trace?n=K`. This enables:
+
+* Fast debugging of unexpected tool chains.
+* Post-hoc inspection without inflating model context (the full trace is not re-fed to the model).
+* Potential future export for structured analytics (latency, error frequencies).
+
+Trace design intentionally truncates large payloads (e.g., sampled rows, multi-view tables) to prevent UI bloat and accidental prompt echoing.
+
+## Random Sampling (`data_sample`)
+
+Purpose: Lightweight, unbiased inspection of a dataframe slice prior to column selection, filtering, or multi-view generation.
+
+Behavior:
+* Parameters: `file_id`, optional `n` (1..1000, clamped), optional `seed`, `replace` (default False).
+* If `n` exceeds dataframe height (and `replace=False`), it is reduced to full height.
+* Returns rows in random order (`shuffle=True`) with explicit `returned` count and echoed seed for reproducibility.
+* Does not create a stored summary (avoids clutter for transient peeks).
+
+Edge considerations:
+* Invalid `file_id` returns error without raising.
+* Seeds allow deterministic test coverage (used in unit tests).
+
+## Multi‑View Generation (`data_ng_views_table`)
+
+Purpose: Generate a ranked shortlist of candidate spatial positions (e.g., top N by a metric) and produce Neuroglancer links for rapid comparative inspection.
+
+Key design points:
+* Accepts either a raw `file_id` dataframe or an existing `summary_id` (derived table). If both provided, summary takes precedence (warning emitted server-side).
+* Sorting: optional `sort_by` + `descending` (default True). If absent, preserves original order (then head `top_n`).
+* Required columns: id column (default `cell_id`) + center coordinate columns (`x,y,z` by default). Missing columns return an error early.
+* Optional include columns appended verbatim if present; missing ones are ignored with a warning.
+* Optional LUT adjustment and per-row point annotation (writes to `annotations` layer) for each ephemeral view.
+* Creates transient mutated copies of the current state to derive links; only the FIRST generated state's JSON replaces `CURRENT_STATE` for continuity.
+* Returns: `{ file_id, summary (new summary metadata), n, rows[], warnings[], first_link }` where each row contains raw `link` and markdown-safe `masked_link` plus included metrics.
+* Stores a summary table in `DataMemory` with kind `ng_views` (excludes raw link column) enabling later re-ranking or selection chaining.
+* Chat response surfaces an aggregated `views_table`; Panel UI renders this in a Tabulator grid with click-to-load internal link behavior and auto-load of the first link (unless disabled).
+
+Schema constraints:
+* OpenAI function schema disallows top-level `oneOf`, so mutual exclusivity of `file_id` vs `summary_id` is enforced in code & documented rather than validated by JSON Schema.
+
+Masking Logic:
+* Raw NG links are transformed to `[Updated Neuroglancer view](...)` during general masking.
+* Within multi-view rows the label is normalized to `[link](...)` for compact tabular display; numeric suffix masking (for multiple distinct links in a single message) is removed here for simplicity.
+
+Failure / resiliency:
+* Per-row exceptions yield a warning entry; processing continues for remaining rows.
+* If no rows succeed, returns `error` with accumulated warnings (no mutation performed).
+
+## Masked Links
+
+All Neuroglancer URLs returned in assistant messages are masked to concise markdown hyperlinks to reduce prompt noise and prevent accidental copying of extremely long fragments. Multiple distinct links in one message receive numeric suffixes. The masking function also detects certain fragment-only tokens.
+
+Multi-view rows intentionally use a short `[link]` label for scannability; the full raw URL stays in the structured JSON row for advanced clients needing direct parsing.
 
 ## Ops / environment
 * Python managed with **uv** (`uv run`, `uv add`).
