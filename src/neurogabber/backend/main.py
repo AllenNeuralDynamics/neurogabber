@@ -7,7 +7,16 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(os.path.dir
 
 from fastapi import FastAPI, UploadFile, Body, Query, File
 from .models import ChatRequest, SetView, SetLUT, AddAnnotations, HistogramReq, IngestCSV, SaveState
-from .tools.neuroglancer_state import new_state, set_view as _set_view, set_lut as _set_lut, add_annotations as _add_ann, to_url, from_url
+from .tools.neuroglancer_state import (
+    new_state,
+    set_view as _set_view,
+    set_lut as _set_lut,
+    add_annotations as _add_ann,
+    add_layer as _add_layer,
+    set_layer_visibility as _set_layer_visibility,
+    to_url,
+    from_url,
+)
 from .tools.plots import sample_voxels, histogram
 from .tools.io import load_csv, top_n_rois
 from .storage.states import save_state, load_state
@@ -52,6 +61,31 @@ def t_set_lut(args: SetLUT):
     global CURRENT_STATE
     CURRENT_STATE = _set_lut(CURRENT_STATE, args.layer, args.vmin, args.vmax)
     return {"ok": True}
+
+@app.post("/tools/ng_add_layer")
+def t_add_layer(name: str = Body(..., embed=True), layer_type: str = Body("image", embed=True), source: str | dict | None = Body(None, embed=True), visible: bool = Body(True, embed=True)):
+    """Add a new layer to the Neuroglancer state if it does not already exist.
+
+    The source parameter is passed through verbatim; clients are responsible for supplying a valid Neuroglancer source spec.
+    """
+    global CURRENT_STATE
+    try:
+        CURRENT_STATE = _add_layer(CURRENT_STATE, name=name, layer_type=layer_type, source=source, visible=visible)
+        return {"ok": True, "layer": name, "layer_type": layer_type}
+    except ValueError as ve:
+        return {"ok": False, "error": str(ve)}
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to add layer: {e}"}
+
+@app.post("/tools/ng_set_layer_visibility")
+def t_set_layer_visibility(name: str = Body(..., embed=True), visible: bool = Body(True, embed=True)):
+    """Set the visibility flag on an existing layer.
+
+    Adds a 'visible' key if not already present; silently no-ops if layer not found.
+    """
+    global CURRENT_STATE
+    CURRENT_STATE = _set_layer_visibility(CURRENT_STATE, name=name, visible=visible)
+    return {"ok": True, "layer": name, "visible": visible}
 
 @app.post("/tools/ng_annotations_add")
 def t_add_annotations(args: AddAnnotations):
@@ -392,6 +426,10 @@ def _execute_tool_by_name(name: str, args: dict):
             return t_data_sample(**args)
         if name == "data_ng_views_table":
             return t_data_ng_views_table(**args)
+        if name == "ng_add_layer":
+            return t_add_layer(**args)
+        if name == "ng_set_layer_visibility":
+            return t_set_layer_visibility(**args)
     except Exception as e:  # pragma: no cover
         logger.exception("Tool execution error")
         return {"error": str(e)}

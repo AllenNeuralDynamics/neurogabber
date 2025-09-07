@@ -37,6 +37,42 @@ TOOLS = [
     }
   },
   {
+    "type": "function",
+    "function": {
+      "name": "ng_add_layer",
+      "description": "Add a new Neuroglancer layer (image, segmentation, or annotation). Idempotent if name exists.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string"},
+          "layer_type": {"type": "string", "enum": ["image","segmentation","annotation"], "default": "image"},
+          "source": {"description": "Layer source spec (string or object, passed through)", "oneOf": [
+            {"type": "string"},
+            {"type": "object"},
+            {"type": "null"}
+          ]},
+          "visible": {"type": "boolean", "default": True}
+        },
+        "required": ["name"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "ng_set_layer_visibility",
+      "description": "Toggle visibility of an existing layer (adds 'visible' key if missing).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string"},
+          "visible": {"type": "boolean"}
+        },
+        "required": ["name","visible"]
+      }
+    }
+  },
+  {
     "type":"function",
     "function": {
       "name":"ng_set_lut",
@@ -252,7 +288,7 @@ TOOLS = TOOLS + DATA_TOOLS
 def run_chat(messages: List[Dict]) -> Dict:
     resp = client.chat.completions.create(
         #model="gpt-4o-mini",  # any tool-capable model
-        model="gpt-5-mini",  # any tool-capable model
+        model="gpt-5-nano",  # any tool-capable model
         messages=messages,
         tools=TOOLS,
         tool_choice="auto"

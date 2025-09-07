@@ -57,6 +57,46 @@ def set_lut(state: Dict, layer_name: str, vmin: float, vmax: float):
             break
     return state
 
+ALLOWED_LAYER_TYPES = {"image", "segmentation", "annotation"}
+
+def add_layer(state: Dict, name: str, layer_type: str = "image", source: str | dict | None = None, **kwargs):
+    """Add a new layer if a layer with that name does not already exist.
+
+    Parameters
+    ----------
+    name : str
+        Layer name (unique).
+    layer_type : str
+        Neuroglancer layer type (e.g. 'image', 'segmentation', 'annotation').
+    source : str | dict | None
+        Source spec (kept generic; caller supplies correct form). If None a placeholder is inserted.
+    kwargs : dict
+        Additional keys to merge into the layer dict (e.g., visible=False).
+    """
+    if layer_type not in ALLOWED_LAYER_TYPES:
+        raise ValueError(f"Unsupported layer_type '{layer_type}'. Allowed: {sorted(ALLOWED_LAYER_TYPES)}")
+    if any(L.get("name") == name for L in state.get("layers", [])):
+        return state  # idempotent; do not duplicate
+    layer = {
+        "type": layer_type,
+        "name": name,
+        # Provide a minimal placeholder source; Neuroglancer may ignore until valid.
+        "source": source if source is not None else "precomputed://example",
+        "visible": kwargs.pop("visible", True),
+    }
+    # Merge any extra kwargs
+    for k, v in kwargs.items():
+        layer[k] = v
+    state.setdefault("layers", []).append(layer)
+    return state
+
+def set_layer_visibility(state: Dict, name: str, visible: bool):
+    for L in state.get("layers", []):
+        if L.get("name") == name:
+            L["visible"] = bool(visible)
+            break
+    return state
+
 
 def add_annotations(state: Dict, layer: str, items):
     # Ensure annotation layer exists
