@@ -305,7 +305,8 @@ chat = ChatInterface(
 
 # ---------------- Settings UI ----------------
 settings_card = pn.Card(
-    pn.Column(auto_load_checkbox, latest_url, open_latest_btn, ng_links_internal, trace_history_checkbox, trace_history_length, trace_download, _recent_traces_accordion, status),
+    pn.Column(auto_load_checkbox, latest_url, open_latest_btn, ng_links_internal, 
+              trace_history_checkbox, trace_history_length, trace_download, _recent_traces_accordion, status),
     title="Settings",
     collapsed=False,
 )
@@ -314,7 +315,7 @@ settings_card = pn.Card(
 # NOTE: We keep upload + table refresh synchronous to avoid early event-loop timing issues
 # during Panel server warm start on some platforms (Windows). Async is still used for
 # LLM/chat + state sync, but simple data listing uses blocking httpx calls.
-file_drop = pn.widgets.FileDropper(name="Drop CSV files here", multiple=True, accepted_filetypes=["text/csv", ".csv"])
+file_drop = pn.widgets.FileDropper(name="Drop CSV files here", multiple=True, accepted_filetypes=["text/csv", ".csv"],sizing_mode="stretch_width")
 upload_notice = pn.pane.Markdown("")
 try:
     import pandas as pd
@@ -322,11 +323,30 @@ except Exception:  # pragma: no cover
     pd = None
 
 if pd is not None:
-    uploaded_table = pn.widgets.Tabulator(pd.DataFrame(columns=["file_id","name","size","n_rows","n_cols"]), height=210, disabled=True)
-    summaries_table = pn.widgets.Tabulator(pd.DataFrame(columns=["summary_id","source_file_id","kind","n_rows","n_cols"]), height=210, disabled=True)
+    uploaded_table = pn.widgets.Tabulator(
+        pd.DataFrame(columns=["file_id","name","size","n_rows","n_cols"]),
+        height=0,  # start collapsed until data present
+        disabled=True,
+        show_index=False,
+    )
+    summaries_table = pn.widgets.Tabulator(
+        pd.DataFrame(columns=["summary_id","source_file_id","kind","n_rows","n_cols"]),
+        height=0,
+        disabled=True,
+        show_index=False,
+    )
 else:
     uploaded_table = pn.pane.Markdown("pandas not available")
     summaries_table = pn.pane.Markdown("pandas not available")
+
+# Helper to update upload card title with dynamic file count
+def _update_upload_card_title(n: int):
+    try:
+        label = "file" if n == 1 else "files"
+        upload_card.title = f"Data Upload (📁 {n} {label})"
+    except Exception:
+        # Fallback silently; title update is non-critical
+        pass
 
 def _refresh_files():
     if pd is None:
@@ -335,12 +355,39 @@ def _refresh_files():
         with httpx.Client(timeout=30) as client:
             lst = client.post(f"{BACKEND}/tools/data_list_files")
             data = lst.json().get("files", [])
+        _update_upload_card_title(len(data))
         if data:
-            uploaded_table.value = pd.DataFrame(data)
+            df = pd.DataFrame(data)
+            # Reorder with name first, keep file_id (hidden) at end for potential future use
+            desired = [c for c in ["name","size","n_rows","n_cols","file_id"] if c in df.columns]
+            df = df[desired]
+            # Rename display columns
+            rename_map = {"name":"Name","size":"Size","n_rows":"Rows","n_cols":"Cols"}
+            df = df.rename(columns=rename_map)
+            uploaded_table.value = df
+            # Hide file_id if present
+            hidden_cols = [c for c in ["file_id"] if c in df.columns]
+            if hidden_cols:
+                uploaded_table.hidden_columns = hidden_cols
+            # Dynamic height: ~40px per row (estimated row height incl. header). Cap at 5 rows.
+            n_rows = len(df)
+            per = 50
+            cap = 10
+            shown = min(n_rows, cap)
+            uploaded_table.height =  (shown * per) + 40  # extra for header
+            if n_rows > cap:
+                uploaded_table.scroll = True
+            else:
+                uploaded_table.scroll = False
+            uploaded_table.visible = True
         else:
-            uploaded_table.value = pd.DataFrame(columns=uploaded_table.value.columns)
+            # Empty: collapse table height & clear
+            uploaded_table.value = pd.DataFrame(columns=["Name","Size","Rows","Cols"])
+            uploaded_table.height = 0
+            uploaded_table.visible = False
     except Exception as e:  # pragma: no cover
         upload_notice.object = f"File list error: {e}"
+        _update_upload_card_title(0)
 
 def _refresh_summaries():
     if pd is None:
@@ -350,9 +397,30 @@ def _refresh_summaries():
             lst = client.post(f"{BACKEND}/tools/data_list_summaries")
             data = lst.json().get("summaries", [])
         if data:
-            summaries_table.value = pd.DataFrame(data)
+            df = pd.DataFrame(data)
+            # Reorder with kind first; retain IDs (hidden) for possible referencing
+            desired_order = [c for c in ["kind","n_rows","n_cols","summary_id","source_file_id"] if c in df.columns]
+            df = df[desired_order]
+            rename_map = {"kind":"Kind","n_rows":"Rows","n_cols":"Cols"}
+            df = df.rename(columns=rename_map)
+            summaries_table.value = df
+            hidden_cols = [c for c in ["summary_id","source_file_id"] if c in df.columns]
+            if hidden_cols:
+                summaries_table.hidden_columns = hidden_cols
+            n_rows = len(df)
+            per = 40
+            cap = 5
+            shown = min(n_rows, cap)
+            summaries_table.height = (shown * per) + 40
+            if n_rows > cap:
+                summaries_table.scroll = True
+            else:
+                summaries_table.scroll = False
+            summaries_table.visible = True
         else:
-            summaries_table.value = pd.DataFrame(columns=summaries_table.value.columns)
+            summaries_table.value = pd.DataFrame(columns=["Kind","Rows","Cols"])
+            summaries_table.height = 0
+            summaries_table.visible = False
     except Exception as e:  # pragma: no cover
         upload_notice.object = f"Summary list error: {e}"
 
@@ -375,10 +443,12 @@ def _handle_file_upload(evt):
                     files={"file": (name, raw_bytes, "text/csv")},
                 )
                 rj = resp.json()
-                if rj.get("ok"):
-                    msgs.append(f"✅ {name} → {rj['file']['file_id']}")
-                else:
-                    msgs.append(f"❌ {name} error: {rj.get('error')}")
+
+                # dont show response here
+                # if rj.get("ok"):
+                #     msgs.append(f"✅ {name} → {rj['file']['file_id']}")
+                # else:
+                #     msgs.append(f"❌ {name} error: {rj.get('error')}")
             except Exception as e:  # pragma: no cover
                 msgs.append(f"❌ {name} exception: {e}")
     upload_notice.object = "\n".join(msgs)
@@ -400,19 +470,36 @@ upload_card = pn.Card(
         pn.pane.Markdown("**Summaries**"),
         summaries_table,
     ),
-    title="Data Upload & Summaries",
+    title="Data Upload",
     collapsed=False,
     width=450,
 )
 
+# Initialize title with zero count until first refresh occurs
+_update_upload_card_title(0)
+
 # ---------------- Assemble App ----------------
 # Main app with sidebar upload + chat, right sidebar settings, main viewer
+# Workspace card (initially collapsed) to host future workspace/status info
+workspace_body = pn.Column(
+    pn.pane.Markdown("### Workspace\n_Add notes, context, or future controls here._"),
+    sizing_mode="stretch_width",
+    scroll=True,
+)
+# Constrain height to 400px with scrolling inside
+workspace_card = pn.Card(
+    workspace_body,
+    title="Workspace",
+    collapsed=True,
+    sizing_mode="stretch_width",
+    styles={"maxHeight": "400px", "overflow": "auto"},
+)
 app = pn.template.FastListTemplate(
     title=f"Neurogabber v {version}",
-    sidebar=[upload_card,chat, views_table],
+    sidebar=[upload_card,chat], #views_table (dont need below)
     right_sidebar=settings_card,
     collapsed_right_sidebar = True,
-    main=[viewer],
+    main=[workspace_card, viewer],
     sidebar_width=450,
     theme="dark",
 )
