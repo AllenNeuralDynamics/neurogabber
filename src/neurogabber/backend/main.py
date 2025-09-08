@@ -8,12 +8,7 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(os.path.dir
 from fastapi import FastAPI, UploadFile, Body, Query, File
 from .models import ChatRequest, SetView, SetLUT, AddAnnotations, HistogramReq, IngestCSV, SaveState
 from .tools.neuroglancer_state import (
-    new_state,
-    set_view as _set_view,
-    set_lut as _set_lut,
-    add_annotations as _add_ann,
-    add_layer as _add_layer,
-    set_layer_visibility as _set_layer_visibility,
+    NeuroglancerState,
     to_url,
     from_url,
 )
@@ -43,7 +38,7 @@ def _dbg(msg: str):  # lightweight wrapper to centralize debug guard
 app = FastAPI()
 
 # In-memory working state per session (MVP). Replace with DB keyed by user/session.
-CURRENT_STATE = new_state()
+CURRENT_STATE = NeuroglancerState()
 DATA_MEMORY = DataMemory()
 INTERACTION_MEMORY = InteractionMemory()
 _TRACE_HISTORY: list[dict] = []  # store recent full traces (in-memory, capped)
@@ -53,13 +48,13 @@ _TRACE_HISTORY_MAX = 50
 @app.post("/tools/ng_set_view")
 def t_set_view(args: SetView):
     global CURRENT_STATE
-    CURRENT_STATE = _set_view(CURRENT_STATE, args.center.model_dump(), args.zoom, args.orientation)
+    CURRENT_STATE.set_view(args.center.model_dump(), args.zoom, args.orientation)
     return {"ok": True}
 
 @app.post("/tools/ng_set_lut")
 def t_set_lut(args: SetLUT):
     global CURRENT_STATE
-    CURRENT_STATE = _set_lut(CURRENT_STATE, args.layer, args.vmin, args.vmax)
+    CURRENT_STATE.set_lut(args.layer, args.vmin, args.vmax)
     return {"ok": True}
 
 @app.post("/tools/ng_add_layer")
@@ -70,7 +65,7 @@ def t_add_layer(name: str = Body(..., embed=True), layer_type: str = Body("image
     """
     global CURRENT_STATE
     try:
-        CURRENT_STATE = _add_layer(CURRENT_STATE, name=name, layer_type=layer_type, source=source, visible=visible)
+        CURRENT_STATE.add_layer(name=name, layer_type=layer_type, source=source, visible=visible)
         return {"ok": True, "layer": name, "layer_type": layer_type}
     except ValueError as ve:
         return {"ok": False, "error": str(ve)}
@@ -84,7 +79,7 @@ def t_set_layer_visibility(name: str = Body(..., embed=True), visible: bool = Bo
     Adds a 'visible' key if not already present; silently no-ops if layer not found.
     """
     global CURRENT_STATE
-    CURRENT_STATE = _set_layer_visibility(CURRENT_STATE, name=name, visible=visible)
+    CURRENT_STATE.set_layer_visibility(name=name, visible=visible)
     return {"ok": True, "layer": name, "visible": visible}
 
 @app.post("/tools/ng_annotations_add")
@@ -100,7 +95,7 @@ def t_add_annotations(args: AddAnnotations):
         elif a.type == "ellipsoid":
             items.append({"type":"ellipsoid", "center": [a.center.x, a.center.y, a.center.z],
                           "radii": [a.size.x/2, a.size.y/2, a.size.z/2], "id": a.id or None})
-    CURRENT_STATE = _add_ann(CURRENT_STATE, args.layer, items)
+    CURRENT_STATE.add_annotations(args.layer, items)
     return {"ok": True}
 
 @app.post("/tools/data_plot_histogram")
@@ -123,8 +118,8 @@ def t_save_state(_: SaveState, mask: bool = Query(False, description="Return mas
     We do masking here (where state is definitively updated) instead of during
     synthetic assistant message generation to avoid presenting stale links.
     """
-    sid = save_state(CURRENT_STATE)
-    url = to_url(CURRENT_STATE)
+    sid = save_state(CURRENT_STATE.as_dict())
+    url = CURRENT_STATE.to_url()
     if mask:
         masked = _mask_ng_urls(url)
         # If masking logic chooses not to transform (unlikely since it's a NG URL), fall back to manual label.
@@ -139,7 +134,7 @@ def t_state_load(link: str = Body(..., embed=True)):
     """Load state from a Neuroglancer URL or fragment and set CURRENT_STATE."""
     global CURRENT_STATE
     try:
-        CURRENT_STATE = from_url(link)
+        CURRENT_STATE = NeuroglancerState.from_url(link)
         return {"ok": True}
     except Exception as e:
         logger.exception("Failed to load state from link")
@@ -155,12 +150,19 @@ def t_demo_load(link: str = Body(..., embed=True)):
 #Optional (alternative path): if you prefer “read-only” to still be tool-based, 
 #add a tiny GET tool like ng_list_layers to the toolset. But since you asked for “no tool” for 
 #that query, the state-summary + system prompt approach above fits better.
-def _summarize_state(state: dict) -> str:
+def _state_dict(state) -> dict:
+    """Return underlying dict for either raw dict or NeuroglancerState."""
+    if isinstance(state, NeuroglancerState):
+        return state.as_dict()
+    return state
+
+def _summarize_state(state) -> str:
     # Keep it short and deterministic. Expand as needed later.
-    layers = state.get("layers", [])
+    sd = _state_dict(state)
+    layers = sd.get("layers", [])
     lines = []
-    lines.append(f"Layout: {state.get('layout','xy')}")
-    pos = state.get("position", [0,0,0])
+    lines.append(f"Layout: {sd.get('layout','xy')}")
+    pos = sd.get("position", [0,0,0])
     lines.append(f"Position: {pos}")
     if layers:
         lines.append("Layers:")
@@ -303,7 +305,7 @@ def chat(req: ChatRequest):
     state_link_block = None
     if overall_mutated:
         try:
-            url = to_url(CURRENT_STATE)
+            url = CURRENT_STATE.to_url()
             masked = _mask_ng_urls(url)
             state_link_block = {"url": url, "masked_markdown": masked}
         except Exception:  # pragma: no cover
@@ -474,7 +476,7 @@ def _mask_ng_urls(text: str) -> str:
 @app.post("/tools/ng_state_link")
 def t_state_link():
     """Return current state link and masked markdown without persisting a new save id."""
-    url = to_url(CURRENT_STATE)
+    url = CURRENT_STATE.to_url()
     masked = _mask_ng_urls(url)
     if masked == url:
         masked = f"[Updated Neuroglancer view]({url})"
@@ -501,7 +503,7 @@ def _synthesize_tool_call_message(tool_calls) -> str:
         return "Applied tools."  # fallback
 
 
-def summarize_state_struct(state: dict, detail: str = "standard") -> dict:
+def summarize_state_struct(state, detail: str = "standard") -> dict:
     """Produce a structured summary for LLM inspection.
 
     detail levels:
@@ -510,7 +512,8 @@ def summarize_state_struct(state: dict, detail: str = "standard") -> dict:
       - full: adds shader length and source kinds
     """
     layers_out = []
-    for L in state.get("layers", []):
+    sd = _state_dict(state)
+    for L in sd.get("layers", []):
         base = {"name": L.get("name"), "type": L.get("type")}
         ltype = L.get("type")
         if detail in ("standard", "full"):
@@ -539,7 +542,7 @@ def summarize_state_struct(state: dict, detail: str = "standard") -> dict:
         layers_out.append(base)
 
     annotation_layers = []
-    for L in state.get("layers", []):
+    for L in sd.get("layers", []):
         if L.get("type") == "annotation":
             anns = (L.get("source") or {}).get("annotations") or []
             types = set()
@@ -554,14 +557,14 @@ def summarize_state_struct(state: dict, detail: str = "standard") -> dict:
             })
 
     return {
-        "layout": state.get("layout"),
-        "position": state.get("position"),
-        "dimensions": state.get("dimensions"),
+    "layout": sd.get("layout"),
+    "position": sd.get("position"),
+    "dimensions": sd.get("dimensions"),
         "layers": layers_out,
         "annotation_layers": annotation_layers,
         "flags": {
-            "showAxisLines": state.get("showAxisLines"),
-            "showScaleBar": state.get("showScaleBar"),
+            "showAxisLines": sd.get("showAxisLines"),
+            "showScaleBar": sd.get("showScaleBar"),
         },
         "version": 1,
         "detail": detail,
@@ -814,22 +817,22 @@ def t_data_ng_views_table(
         first_state = None
         # We'll generate links from ephemeral mutated copies; not persisting with save_state
         for idx, row in enumerate(subset.to_dicts()):
-            # mutate copy of CURRENT_STATE
-            state_copy = deepcopy(CURRENT_STATE)
+            # mutate copy of CURRENT_STATE using cheap deep clone
+            state_copy = CURRENT_STATE.clone()
             try:
                 # set view center; reuse internal set_view logic
                 cx, cy, cz = (row[center_columns[0]], row[center_columns[1]], row[center_columns[2]])
-                state_copy = _set_view(state_copy, {"x": cx, "y": cy, "z": cz}, None, None)
+                state_copy.set_view({"x": cx, "y": cy, "z": cz}, None, None)
                 # LUT optionally
                 if lut and lut.get("layer") and "min" in lut and "max" in lut:
-                    state_copy = _set_lut(state_copy, lut["layer"], lut.get("min"), lut.get("max"))
+                    state_copy.set_lut(lut["layer"], lut.get("min"), lut.get("max"))
                 # annotation optionally
                 if annotations:
                     ann_items = [
                         {"point": [cx, cy, cz], "id": str(row.get(id_column, idx))}
                     ]
-                    state_copy = _add_ann(state_copy, "annotations", ann_items)
-                link_url = to_url(state_copy)
+                    state_copy.add_annotations("annotations", ann_items)
+                link_url = state_copy.to_url()
                 masked = _mask_ng_urls(link_url)
                 if masked == link_url:
                     masked = f"[link]({link_url})"

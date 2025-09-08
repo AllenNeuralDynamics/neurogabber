@@ -14,6 +14,8 @@ def test_tool_names_are_underscored_and_valid():
         "ng_set_view",
         "ng_set_lut",
         "ng_annotations_add",
+        "ng_add_layer",
+        "ng_set_layer_visibility",
         "data_plot_histogram",
         "data_ingest_csv_rois",
         "state_save",

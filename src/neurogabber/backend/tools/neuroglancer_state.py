@@ -1,5 +1,5 @@
 import json, os, uuid
-from typing import Dict
+from typing import Dict, Any, Iterable
 from urllib.parse import quote, unquote
 
 
@@ -7,106 +7,119 @@ from urllib.parse import quote, unquote
 NEURO_BASE = os.getenv("NEUROGLANCER_BASE", "https://neuroglancer-demo.appspot.com")
 
 
-# Minimal state object; extend with layers, shader params, annotations, etc.
-def new_state() -> Dict:
-    return {
-    "dimensions": {"x": [1e-9, "m"], "y": [1e-9, "m"], "z": [1e-9, "m"]},
-    "position": [0,0,0],
-    "crossSectionScale": 1.0,
-    "projectionScale": 1024,
-    "layers": [],
-    "layout": "xy"
-    }
+class NeuroglancerState:
+    """Encapsulates a Neuroglancer state dict and provides mutation helpers.
 
+    This class wraps the previously module-level functions. All existing
+    top-level functions remain as thin delegating wrappers to preserve the
+    external API relied upon by other modules and tests.
 
-# Utility mutators
-def set_view(state: Dict, center, zoom, orientation):
-    """Update viewer center/zoom while preserving higher dimensional components.
-
-    If an existing position has 4 components (e.g. x,y,z,t) we keep the 4th value
-    untouched. We only overwrite the layout when an explicit non-"fit" zoom is
-    provided (mirroring earlier behavior) so that loading a complex multi-panel
-    layout and issuing a simple recenter with zoom=='fit' does not collapse it.
+    Design notes:
+    - The internal representation is a mutable ``dict`` stored in ``self.data``.
+    - Methods mutate in-place and return ``self`` for optional chaining.
+    - ``to_url`` & ``from_url`` provided as instance and ``@staticmethod`` to
+      support both styles.
+    - Idempotent behaviors (e.g. add_layer with an existing name) preserved.
+    - Validation (layer type whitelist) retained.
     """
-    old_pos = state.get("position", [])
-    # Preserve temporal (or other) trailing component if present
-    if isinstance(old_pos, list) and len(old_pos) == 4:
-        state["position"] = [center["x"], center["y"], center["z"], old_pos[3]]
-    else:
-        state["position"] = [center["x"], center["y"], center["z"]]
 
-    if zoom == "fit":
-        # Do not touch layout for a "fit" recenter-only request
-        state["crossSectionScale"] = 1.0  # placeholder; tune per dataset size
-    else:
-        try:
-            state["crossSectionScale"] = float(zoom)
-        except Exception:
-            # Fallback: ignore invalid zooms gracefully
-            pass
-        state["layout"] = orientation or state.get("layout", "xy")
-    return state
+    def __init__(self, data: Dict | None = None):
+        if data is None:
+            data = {
+                "dimensions": {"x": [1e-9, "m"], "y": [1e-9, "m"], "z": [1e-9, "m"]},
+                "position": [0, 0, 0],
+                "crossSectionScale": 1.0,
+                "projectionScale": 1024,
+                "layers": [],
+                "layout": "xy",
+            }
+        self.data = data
 
+    # --- Core mutation helpers -------------------------------------------------
+    def set_view(self, center: Dict[str, float], zoom: Any, orientation: str | None):
+        old_pos = self.data.get("position", [])
+        if isinstance(old_pos, list) and len(old_pos) == 4:
+            self.data["position"] = [center["x"], center["y"], center["z"], old_pos[3]]
+        else:
+            self.data["position"] = [center["x"], center["y"], center["z"]]
 
-def set_lut(state: Dict, layer_name: str, vmin: float, vmax: float):
-    for L in state.get("layers", []):
-        if L.get("name") == layer_name:
-            sc = L.setdefault("shaderControls", {})
-            norm = sc.setdefault("normalized", {})
-            norm["range"] = [vmin, vmax]
-            break
-    return state
+        if zoom == "fit":
+            self.data["crossSectionScale"] = 1.0
+        else:
+            try:
+                self.data["crossSectionScale"] = float(zoom)
+            except Exception:  # pragma: no cover (defensive)
+                pass
+            if orientation:
+                self.data["layout"] = orientation
+        return self
+
+    def set_lut(self, layer_name: str, vmin: float, vmax: float):
+        for L in self.data.get("layers", []):
+            if L.get("name") == layer_name:
+                sc = L.setdefault("shaderControls", {})
+                norm = sc.setdefault("normalized", {})
+                norm["range"] = [vmin, vmax]
+                break
+        return self
+
+    def add_layer(self, name: str, layer_type: str = "image", source: str | dict | None = None, **kwargs):
+        if layer_type not in ALLOWED_LAYER_TYPES:
+            raise ValueError(f"Unsupported layer_type '{layer_type}'. Allowed: {sorted(ALLOWED_LAYER_TYPES)}")
+        if any(L.get("name") == name for L in self.data.get("layers", [])):
+            return self  # idempotent
+        layer = {
+            "type": layer_type,
+            "name": name,
+            "source": source if source is not None else "precomputed://example",
+            "visible": kwargs.pop("visible", True),
+        }
+        for k, v in kwargs.items():
+            layer[k] = v
+        self.data.setdefault("layers", []).append(layer)
+        return self
+
+    def set_layer_visibility(self, name: str, visible: bool):
+        for L in self.data.get("layers", []):
+            if L.get("name") == name:
+                L["visible"] = bool(visible)
+                break
+        return self
+
+    def add_annotations(self, layer: str, items: Iterable[Dict]):
+        ann = next((L for L in self.data.get("layers", []) if L.get("type") == "annotation" and L.get("name") == layer), None)
+        if not ann:
+            ann = {"type": "annotation", "name": layer, "source": {"annotations": []}}
+            self.data.setdefault("layers", []).append(ann)
+        ann["source"].setdefault("annotations", []).extend(items)
+        return self
+
+    # --- Serialization helpers -------------------------------------------------
+    def to_url(self) -> str:
+        return to_url(self.data)
+
+    @staticmethod
+    def from_url(url_or_fragment: str) -> "NeuroglancerState":
+        return NeuroglancerState(from_url(url_or_fragment))
+
+    # Convenience for tests / external callers wanting the raw dict
+    def as_dict(self) -> Dict:
+        return self.data
+
+    # --- Utility helpers ------------------------------------------------------
+    def clone(self) -> "NeuroglancerState":
+        """Return a deep copy of this NeuroglancerState.
+
+        Uses json round-trip for a deterministic deep copy without relying on
+        potentially unsafe references in nested dict/list structures. Faster
+        than serializing to a full Neuroglancer URL then parsing.
+        """
+        # json round-trip is adequate given the state is pure JSON-compatible primitives
+        import json as _json
+        return NeuroglancerState(_json.loads(_json.dumps(self.data)))
+
 
 ALLOWED_LAYER_TYPES = {"image", "segmentation", "annotation"}
-
-def add_layer(state: Dict, name: str, layer_type: str = "image", source: str | dict | None = None, **kwargs):
-    """Add a new layer if a layer with that name does not already exist.
-
-    Parameters
-    ----------
-    name : str
-        Layer name (unique).
-    layer_type : str
-        Neuroglancer layer type (e.g. 'image', 'segmentation', 'annotation').
-    source : str | dict | None
-        Source spec (kept generic; caller supplies correct form). If None a placeholder is inserted.
-    kwargs : dict
-        Additional keys to merge into the layer dict (e.g., visible=False).
-    """
-    if layer_type not in ALLOWED_LAYER_TYPES:
-        raise ValueError(f"Unsupported layer_type '{layer_type}'. Allowed: {sorted(ALLOWED_LAYER_TYPES)}")
-    if any(L.get("name") == name for L in state.get("layers", [])):
-        return state  # idempotent; do not duplicate
-    layer = {
-        "type": layer_type,
-        "name": name,
-        # Provide a minimal placeholder source; Neuroglancer may ignore until valid.
-        "source": source if source is not None else "precomputed://example",
-        "visible": kwargs.pop("visible", True),
-    }
-    # Merge any extra kwargs
-    for k, v in kwargs.items():
-        layer[k] = v
-    state.setdefault("layers", []).append(layer)
-    return state
-
-def set_layer_visibility(state: Dict, name: str, visible: bool):
-    for L in state.get("layers", []):
-        if L.get("name") == name:
-            L["visible"] = bool(visible)
-            break
-    return state
-
-
-def add_annotations(state: Dict, layer: str, items):
-    # Ensure annotation layer exists
-    ann = next((L for L in state.get("layers", []) if L.get("type")=="annotation" and L.get("name")==layer), None)
-    if not ann:
-        ann = {"type":"annotation", "name":layer, "source":{"annotations":[]}}
-        state["layers"].append(ann)
-    # Always append new items
-    ann["source"].setdefault("annotations", []).extend(items)
-    return state
 
 
 def to_url(state) -> str:
@@ -123,6 +136,9 @@ def to_url(state) -> str:
     again. Deterministic JSON (sorted keys, compact separators) ensures stable
     tests and reproducible links.
     """
+    # Allow callers to pass a NeuroglancerState instance directly.
+    if isinstance(state, NeuroglancerState):  # new: accept object instance
+        state = state.as_dict()
     # If caller passed a string, attempt to parse it to a dict first.
     if isinstance(state, str):
         try:

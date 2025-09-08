@@ -60,6 +60,8 @@ uv sync
 * FastAPI backend with pluggable data & visualization tools (Polars-based dataframe utilities)
 * Panel-based UI prototype embedding a Neuroglancer viewer
 * Full Neuroglancer state retention (layers, transforms, shader controls, layout) with deterministic URL round‑trip
+* Class-based Neuroglancer state API (`NeuroglancerState`) with chainable mutators and `clone()` for safe ephemeral derivations
+* Layer management tools: add image/segmentation/annotation layers (`ng_add_layer`) and toggle visibility (`ng_set_layer_visibility`)
 * Optional auto-load toggle for applying newly generated Neuroglancer views
 * `data_info` tool for dataframe metadata (shape, columns, dtypes, sample rows)
 * `data_sample` tool for quick unbiased random row sampling (optional seed)
@@ -68,9 +70,60 @@ uv sync
 
 ## Neuroglancer State Handling
 
-The backend now preserves the *entire* Neuroglancer JSON state parsed from any loaded URL (including complex multi-panel layouts, per-layer transforms, shader code/controls, etc.). Tool mutators (`ng_set_view`, `ng_set_lut`, `ng_annotations_add`) only touch the specific fields they need without pruning unrelated keys. Position updates preserve a 4th temporal component when present. A `zoom == "fit"` request recenters without altering the existing layout, helping maintain multi-panel arrangements.
+The backend preserves the *entire* Neuroglancer JSON state parsed from any loaded URL (including multi-panel layouts, per-layer transforms, shader code/controls, shader ranges, dimensions, etc.).
 
-Serialization (`state_save`) uses deterministic JSON ordering so round‑trip tests can assert `from_url(to_url(state)) == state` for typical viewer states.
+### Class API
+
+All state mutation now goes through the `NeuroglancerState` class (procedural helper functions were removed). Methods mutate in place and return `self` for optional chaining:
+
+```python
+from neurogabber.backend.tools.neuroglancer_state import NeuroglancerState
+
+state = NeuroglancerState()
+state.set_view({"x": 10, "y": 20, "z": 30}, "fit", "xy") \
+    .add_layer("em", layer_type="image", source="precomputed://bucket/em") \
+    .set_lut("em", 0, 255) \
+    .add_annotations("ROIs", [{"point": [10,20,30], "id": "r1"}])
+
+url = state.to_url()          # serialize
+state2 = NeuroglancerState.from_url(url)  # parse
+
+# Safe ephemeral copy for experimentation (no shared references):
+scratch = state.clone().set_view({"x": 0, "y": 0, "z": 0}, None, None)
+```
+
+Available mutators:
+* `set_view(center, zoom, orientation)`
+* `set_lut(layer_name, vmin, vmax)`
+* `add_layer(name, layer_type, source, **kwargs)` (idempotent on duplicate name)
+* `set_layer_visibility(name, visible)`
+* `add_annotations(layer_name, iterable_of_annotation_dicts)`
+* `clone()` – deep JSON copy (faster & cleaner than URL round‑trip)
+
+Low-level helpers `to_url(obj)` and `from_url(str)` accept either a raw dict, a `NeuroglancerState` instance, a full URL, a hash fragment, or raw JSON. `to_url(to_url(state))` is idempotent.
+
+### Mutating Tools
+
+Server-exposed tool endpoints wrap class methods:
+* `ng_set_view`
+* `ng_set_lut`
+* `ng_add_layer`
+* `ng_set_layer_visibility`
+* `ng_annotations_add`
+
+Each mutator is minimal and never strips unrelated keys. Position updates preserve a 4th component if present (e.g. time).
+
+### Cloning Strategy
+
+Multi-view generation (`data_ng_views_table`) uses `CURRENT_STATE.clone()` for each candidate row to avoid repeated URL encode/decode overhead and to eliminate accidental shared nested references. Only the first generated view becomes the new `CURRENT_STATE` for continuity.
+
+### Deterministic Serialization
+
+`to_url()` produces compact, sorted-key JSON so tests (and downstream caching) can rely on stable string equality: `from_url(to_url(state_dict)) == state_dict` for typical states.
+
+### Migration Note
+
+Legacy procedural helpers (`new_state`, `set_view`, `set_lut`, `add_annotations`, etc.) were removed in favor of the class API; update any external prototypes accordingly.
 
 ## Auto‑Load Toggle
 

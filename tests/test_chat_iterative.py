@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 from neurogabber.backend.main import app, DATA_MEMORY, CURRENT_STATE
-from neurogabber.backend.tools.neuroglancer_state import new_state
+from neurogabber.backend.tools.neuroglancer_state import NeuroglancerState
 
 client = TestClient(app)
 
@@ -48,7 +48,7 @@ def test_data_info_non_mutating_no_link(monkeypatch):
 def test_mutating_tool_returns_link(monkeypatch):
     # Reset state (optional for clarity)
     from neurogabber.backend import main as backend_main
-    backend_main.CURRENT_STATE = new_state()
+    backend_main.CURRENT_STATE = NeuroglancerState()
 
     def fake_run_chat(msgs):
         iteration = len([m for m in msgs if m.get("role") == "assistant"])  # same tactic

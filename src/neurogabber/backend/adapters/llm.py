@@ -2,7 +2,10 @@ import os, json
 from typing import List, Dict
 from openai import OpenAI
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+_API_KEY = os.getenv("OPENAI_API_KEY")
+client = None
+if _API_KEY:
+  client = OpenAI(api_key=_API_KEY)
 
 SYSTEM_PROMPT = """
 You are Neurogabber, a helpful assistant for Neuroglancer.
@@ -286,11 +289,17 @@ TOOLS = TOOLS + DATA_TOOLS
 
 
 def run_chat(messages: List[Dict]) -> Dict:
-    resp = client.chat.completions.create(
-        #model="gpt-4o-mini",  # any tool-capable model
-        model="gpt-5-nano",  # any tool-capable model
-        messages=messages,
-        tools=TOOLS,
-        tool_choice="auto"
-    )
-    return resp.model_dump()
+  if client is None:
+    # Fallback mock response for test environments without API key.
+    # Return structure mimicking OpenAI response with no tool calls so logic can proceed.
+    return {
+      "choices": [{"index": 0, "message": {"role": "assistant", "content": "(LLM disabled: no OPENAI_API_KEY set)"}}],
+      "usage": {}
+    }
+  resp = client.chat.completions.create(
+    model="gpt-5-nano",  # any tool-capable model
+    messages=messages,
+    tools=TOOLS,
+    tool_choice="auto"
+  )
+  return resp.model_dump()

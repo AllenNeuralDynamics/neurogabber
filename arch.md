@@ -37,7 +37,7 @@ backend/
   main.py                 # FastAPI app, tool & data endpoints, prompt augmentation
   models.py               # Pydantic schemas (Vec3, SetView, ...)
   tools/
-    neuroglancer_state.py # state helpers (set_view, set_lut, add_annotations, to_url)
+    neuroglancer_state.py # NeuroglancerState class (set_view, set_lut, add_layer, set_layer_visibility, add_annotations, clone, to_url/from_url)
     io.py                 # CSV ingest (top_n_rois)
     plots.py              # histogram sampling (stub)
   adapters/
@@ -123,6 +123,8 @@ flowchart TD
 Neuroglancer / visualization:
 * `POST /tools/ng_set_view` — center/zoom/orientation (mutating)
 * `POST /tools/ng_set_lut` — LUT range (mutating)
+* `POST /tools/ng_add_layer` — add new layer (image/segmentation/annotation) idempotently
+* `POST /tools/ng_set_layer_visibility` — toggle visibility of existing layer
 * `POST /tools/ng_annotations_add` — add annotations (mutating)
 * `POST /tools/ng_state_summary` — structured snapshot (read-only)
 * `POST /tools/ng_state_link` — URL + masked markdown (read-only)
@@ -141,7 +143,7 @@ Data (Polars):
 * `POST /tools/data_plot_histogram` — histogram (stub)
 
 ## Current features
-* Prompt-driven navigation: set view, set LUT, add annotations.
+* Prompt-driven navigation: set view, set LUT, add / hide layers, add annotations.
 * CSV drag & drop → in-memory Polars DataFrames with short IDs.
 * Data tools: list, preview, describe, select, list summaries.
 * Interaction memory: rolling context appended to system messages.
@@ -151,7 +153,7 @@ Data (Polars):
 * Masking of raw Neuroglancer URLs (backend + frontend fallback).
 * Tool execution trace (`tool_trace`) in chat response plus `/debug/tool_trace` for recent full traces.
 * Random row sampling via `data_sample` (deterministic with optional seed, without replacement by default).
-* Multi‑view generation via `data_ng_views_table` returning a table of ranked rows with per‑row NG links and auto‑loading the first view.
+* Multi‑view generation via `data_ng_views_table` returning a table of ranked rows with per‑row NG links and auto‑loading the first view (uses `NeuroglancerState.clone()` for efficient ephemeral copies).
 
 ## Planned (near‑term)
 * Real CloudVolume sampling (ROI support, multiscale) + caching.
@@ -199,7 +201,7 @@ Key design points:
 * Required columns: id column (default `cell_id`) + center coordinate columns (`x,y,z` by default). Missing columns return an error early.
 * Optional include columns appended verbatim if present; missing ones are ignored with a warning.
 * Optional LUT adjustment and per-row point annotation (writes to `annotations` layer) for each ephemeral view.
-* Creates transient mutated copies of the current state to derive links; only the FIRST generated state's JSON replaces `CURRENT_STATE` for continuity.
+* Creates transient mutated copies of the current state to derive links using `CURRENT_STATE.clone()` (deep JSON copy); only the FIRST generated state's JSON replaces `CURRENT_STATE` for continuity.
 * Returns: `{ file_id, summary (new summary metadata), n, rows[], warnings[], first_link }` where each row contains raw `link` and markdown-safe `masked_link` plus included metrics.
 * Stores a summary table in `DataMemory` with kind `ng_views` (excludes raw link column) enabling later re-ranking or selection chaining.
 * Chat response surfaces an aggregated `views_table`; Panel UI renders this in a Tabulator grid with click-to-load internal link behavior and auto-load of the first link (unless disabled).
@@ -208,7 +210,7 @@ Schema constraints:
 * OpenAI function schema disallows top-level `oneOf`, so mutual exclusivity of `file_id` vs `summary_id` is enforced in code & documented rather than validated by JSON Schema.
 
 Masking Logic:
-* Raw NG links are transformed to `[Updated Neuroglancer view](...)` during general masking.
+* Raw NG links are transformed to `[Updated Neuroglancer view](...)` during general masking (idempotent).
 * Within multi-view rows the label is normalized to `[link](...)` for compact tabular display; numeric suffix masking (for multiple distinct links in a single message) is removed here for simplicity.
 
 Failure / resiliency:
