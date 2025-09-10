@@ -53,9 +53,72 @@ Alternatively, if using `uv`, run
 uv sync
 ```
 
+For cloud storage support (optional), install additional dependencies:
+```bash
+# For S3 pointer expansion
+uv add boto3
+
+# For Google Cloud Storage pointer expansion  
+uv add google-cloud-storage
+
+# Or install both
+uv add boto3 google-cloud-storage
+```
+
 ##
+
 + https://hemibrain-dot-neuroglancer-demo.appspot.com/#!gs://neuroglancer-janelia-flyem-hemibrain/v1.0/neuroglancer_demo_states/base.json
-https://aind-neuroglancer-sauujisjxq-uw.a.run.app/#!s3://aind-open-data/HCR_754803-03_2025-04-04_13-00-00/raw_data.json
++ https://aind-neuroglancer-sauujisjxq-uw.a.run.app/#!s3://aind-open-data/HCR_754803-03_2025-04-04_13-00-00/raw_data.json
+
+## JSON Pointer Expansion
+
+The panel app now automatically detects and expands JSON pointer URLs that reference external state files in cloud storage. This enables easy sharing of complex Neuroglancer states via simple links.
+
+### Supported URL Schemes
+
+* **S3**: `s3://bucket/path/to/state.json` (requires `pip install boto3`)
+* **Google Cloud Storage**: `gs://bucket/path/to/state.json` (requires `pip install google-cloud-storage`)
+* **HTTP/HTTPS**: `http://example.com/state.json` or `https://example.com/state.json`
+
+### Usage Examples
+
+Simply paste any of these URL formats into the Neuroglancer URL field:
+
+```
+# Google Cloud Storage pointer
+https://neuroglancer-demo.appspot.com/#!gs://neuroglancer-janelia-flyem-hemibrain/v1.0/neuroglancer_demo_states/base.json
+
+# S3 pointer
+https://aind-neuroglancer.com/#!s3://aind-open-data/dataset/state.json
+
+# HTTP pointer
+https://neuroglancer-demo.appspot.com/#!https://example.com/states/hemibrain.json
+
+# Direct pointer (no base URL)
+gs://my-bucket/states/cortex-view.json
+```
+
+The panel will automatically:
+1. Detect the JSON pointer in the URL
+2. Fetch the JSON content from cloud storage or HTTP
+3. Expand it into a canonical Neuroglancer URL with inline state
+4. Update both the viewer and backend state
+
+### Error Handling
+
+* Missing cloud dependencies (boto3, google-cloud-storage) are handled gracefully
+* Network failures fall back to the original URL
+* Status messages keep you informed of expansion progress
+* Invalid JSON or malformed URLs are handled with clear error messages
+
+### Debounce Configuration
+
+To prevent excessive backend updates during URL editing, the panel includes configurable debounce logic:
+
+* **Update Interval**: Adjustable from 1 second to infinity (default: 5 seconds)
+* **User Changes**: Debounced according to the configured interval
+* **Programmatic Changes**: Immediate synchronization without debounce
+* **Settings Widget**: Located in the panel interface for easy adjustment
 
 
 ## Features
@@ -72,6 +135,9 @@ https://aind-neuroglancer-sauujisjxq-uw.a.run.app/#!s3://aind-open-data/HCR_7548
 * `data_sample` tool for quick unbiased random row sampling (optional seed)
 * `data_ng_views_table` tool to generate ranked multi-view Neuroglancer links (top N by a metric)
 * Tool execution trace returned with each chat + debug endpoint for recent full traces
+* **JSON Pointer Expansion**: Automatic detection and expansion of s3://, gs://, and http(s):// pointer URLs
+* **Configurable Debounce**: User-adjustable update interval with intelligent programmatic bypass
+* **Cloud Storage Integration**: Optional boto3 and google-cloud-storage support with graceful dependency handling
 
 ## Neuroglancer State Handling
 

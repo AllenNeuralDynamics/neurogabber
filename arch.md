@@ -1,6 +1,6 @@
 # Neurogabber — Architecture (Enhanced MVP)
 
-Concise overview of the current repo, data flow, in‑memory data/memory model, and roadmap. Updated after adding ephemeral CSV upload support, dataframe tools (Polars), and conversational memory.
+Concise overview of the current repo, data flow, in‑memory data/memory model, and roadmap. Updated after adding ephemeral CSV upload support, dataframe tools (Polars), conversational memory, and JSON pointer expansion with debounce functionality.
 
 ## Goal
 Chat-driven navigation of massive neuroimaging data in **Neuroglancer** plus lightweight in-session analysis of user-supplied tabular data (e.g., ROIs CSV). Start with **state links**, move toward **same-origin embedding**.
@@ -15,7 +15,7 @@ Chat-driven navigation of massive neuroimaging data in **Neuroglancer** plus lig
   * `InteractionMemory` — rolling window of recent exchanges (trimmed by count and total chars)
 
 ### Frontends
-* **Panel**: `ChatInterface` + `panel-neuroglancer` widget; drag‑and‑drop CSV upload; tables of uploaded files & summaries; helper prompt button; conditional auto-load of new Neuroglancer state links.
+* **Panel**: `ChatInterface` + `panel-neuroglancer` widget; drag‑and‑drop CSV upload; tables of uploaded files & summaries; helper prompt button; conditional auto-load of new Neuroglancer state links; JSON pointer expansion with debounce; configurable update interval (1-∞ seconds, default 5).
 * **React/Next.js**: minimal chat prototype (execution orchestration pattern shared).
 
 ### Data layer
@@ -40,13 +40,14 @@ backend/
     neuroglancer_state.py # NeuroglancerState class (set_view, set_lut, add_layer, set_layer_visibility, add_annotations, clone, to_url/from_url)
     io.py                 # CSV ingest (top_n_rois)
     plots.py              # histogram sampling (stub)
+    pointer_expansion.py  # JSON pointer expansion for s3://, gs://, http(s):// URLs
   adapters/
     llm.py                # tool-calling adapter (system prompt + tool schemas)
   storage/
     states.py             # in-memory NG state persistence
     data.py               # DataMemory (uploads/summaries) & InteractionMemory
 panel/
-  panel_app.py            # ChatInterface + upload UI + embedded Neuroglancer
+  panel_app.py            # ChatInterface + upload UI + embedded Neuroglancer + pointer expansion + debounce
 frontend/
   app/
     page.tsx              # minimal chat page
@@ -54,7 +55,36 @@ frontend/
 tests/
   test_llm_tools.py       # validates exposed tool names
   test_data_tools.py      # covers upload, preview, describe, select flows
+  test_pointer_expansion.py # tests JSON pointer expansion functionality
+  test_panel_integration.py # tests panel app integration features
 ```
+
+## JSON Pointer Expansion System
+
+The panel app now includes automatic expansion of JSON pointer URLs that reference external JSON state files. This enables sharing of complex Neuroglancer states via cloud storage links.
+
+### Supported URL Schemes
+* **S3**: `s3://bucket/path/to/state.json` (requires boto3)
+* **Google Cloud Storage**: `gs://bucket/path/to/state.json` (requires google-cloud-storage)
+* **HTTP/HTTPS**: `http://example.com/state.json` or `https://example.com/state.json`
+
+### Detection & Expansion Flow
+1. **Detection**: URLs containing fragments with JSON pointers (e.g., `https://neuroglancer-demo.appspot.com/#!s3://bucket/state.json`) are automatically detected.
+2. **Fetching**: The pointer URL is fetched using appropriate protocol handlers with graceful fallback for missing dependencies.
+3. **Expansion**: JSON content is parsed and embedded into the Neuroglancer URL as an inline fragment.
+4. **URL Update**: The panel viewer is updated with the canonical expanded URL.
+5. **Backend Sync**: The expanded state is synchronized with the backend.
+
+### Error Handling
+* Network failures, invalid JSON, and missing cloud credentials are handled gracefully
+* Status messages inform users of expansion progress and errors
+* Failed expansions fall back to the original URL
+
+### Debounce Logic
+To prevent excessive backend updates, URL changes are debounced:
+* **User-initiated changes**: Debounced with configurable interval (1-∞ seconds, default 5)
+* **Programmatic changes**: Immediate synchronization without debounce
+* **Update interval widget**: Allows users to customize the debounce delay
 
 ## Data flow (prompt → view + data)
 1. UI sends user text → `POST /agent/chat`.
@@ -70,10 +100,11 @@ tests/
 4. Final assistant message plus `mutated` flag and (if any mutation) `state_link` object `{url, masked_markdown}` returned to client.
 5. Panel displays answer; if `mutated` and auto-load enabled it loads the returned Neuroglancer URL.
 6. CSV uploads: Panel posts each file to `/upload_file`, then refreshes file & summary tables via list endpoints.
-7. CSV uploads: Panel posts each file to `/upload_file`, then refreshes file & summary tables via list endpoints.
-8. Persistence only when user explicitly asks (`/tools/state_save`).
+7. **JSON Pointer Expansion**: Panel automatically detects and expands pointer URLs (s3://, gs://, http(s)://) to canonical Neuroglancer URLs with inline JSON state.
+8. **Debounced Updates**: User-initiated URL changes are debounced with configurable interval; programmatic changes bypass debounce.
+9. Persistence only when user explicitly asks (`/tools/state_save`).
 
-### Mermaid: Chat + Data + Memory Flow
+### Mermaid: Chat + Data + Memory + Pointer Expansion Flow
 
 ```mermaid
 flowchart TD
@@ -84,6 +115,17 @@ flowchart TD
     Viewer[Neuroglancer Widget]
     FilesTable[Files Table]
     SummariesTable[Summaries Table]
+    UrlInput[URL Change]
+    IntervalWidget[Update Interval Widget]
+  end
+
+  subgraph PointerSystem[JSON Pointer Expansion]
+    Detection[Pointer Detection]
+    S3Fetch[S3 Fetcher]
+    GSFetch[GS Fetcher]
+    HTTPFetch[HTTP Fetcher]
+    JsonExpand[JSON Expansion]
+    Debounce[Debounce Logic]
   end
 
   subgraph Backend[FastAPI Backend]
@@ -91,6 +133,7 @@ flowchart TD
     Tools[/POST /tools/*/]
     StateLink[/POST /tools/ng_state_link/]
     UploadEP[/POST /upload_file/]
+    StateLoad[/POST /tools/state_load/]
     subgraph Memory[In‑Memory Stores]
       CurrentState[(CURRENT_STATE)]
       DataMem[(DataMemory\n(Polars DFs+Summaries))]
@@ -102,6 +145,18 @@ flowchart TD
 
   U --> ChatUI --> ChatEP
   Upload --> UploadEP --> DataMem
+  UrlInput --> Detection
+  Detection -->|s3://| S3Fetch
+  Detection -->|gs://| GSFetch
+  Detection -->|http(s)://| HTTPFetch
+  S3Fetch --> JsonExpand
+  GSFetch --> JsonExpand
+  HTTPFetch --> JsonExpand
+  JsonExpand --> Debounce
+  Debounce -->|User change| IntervalWidget
+  Debounce -->|Programmatic| Viewer
+  Debounce --> StateLoad
+  
   ChatEP -->|Augment prompt with| InterMem
   ChatEP -->|Augment prompt with| DataMem
   ChatEP -->|Augment prompt with| CurrentState
@@ -117,6 +172,7 @@ flowchart TD
   Tools --> DataMem --> SummariesTable
   DataMem --> FilesTable
   InterMem --> ChatEP
+  StateLoad --> CurrentState
 ```
 
 ## Tool surface (HTTP endpoints)
@@ -154,6 +210,9 @@ Data (Polars):
 * Tool execution trace (`tool_trace`) in chat response plus `/debug/tool_trace` for recent full traces.
 * Random row sampling via `data_sample` (deterministic with optional seed, without replacement by default).
 * Multi‑view generation via `data_ng_views_table` returning a table of ranked rows with per‑row NG links and auto‑loading the first view (uses `NeuroglancerState.clone()` for efficient ephemeral copies).
+* **JSON Pointer Expansion**: Automatic detection and expansion of s3://, gs://, and http(s):// pointer URLs to canonical Neuroglancer URLs with inline JSON state.
+* **Configurable Debounce**: User-adjustable update interval (1-∞ seconds) with immediate synchronization for programmatic changes.
+* **Cloud Storage Integration**: Optional boto3 and google-cloud-storage support with graceful fallback for missing dependencies.
 
 ## Planned (near‑term)
 * Real CloudVolume sampling (ROI support, multiscale) + caching.
@@ -256,5 +315,5 @@ Current scope: small tool surface (<20), single round tool selection, explicit p
 * Persistence / export of derived summaries (download endpoints?).
 
 ---
-Last updated: after data tools & memory integration.
+Last updated: after data tools, memory integration, and JSON pointer expansion with debounce functionality.
 

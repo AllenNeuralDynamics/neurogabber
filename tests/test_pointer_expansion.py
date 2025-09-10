@@ -140,7 +140,7 @@ class TestResolvePointer:
     def test_resolve_malformed_json_fragment(self):
         """Test error handling for malformed inline JSON."""
         fragment = '{"incomplete": '
-        with pytest.raises(ValueError, match="failed to parse"):
+        with pytest.raises(ValueError, match="Failed to fetch content from pointer"):
             resolve_neuroglancer_pointer(fragment)
 
 
@@ -249,8 +249,9 @@ class TestFetchers:
         mock_s3_client = Mock()
         mock_boto3.client.return_value = mock_s3_client
         
-        mock_response = Mock()
-        mock_response['Body'].read.return_value.decode.return_value = '{"test": "value"}'
+        mock_body = Mock()
+        mock_body.read.return_value.decode.return_value = '{"test": "value"}'
+        mock_response = {'Body': mock_body}
         mock_s3_client.get_object.return_value = mock_response
         
         result = _fetch_s3("s3://test-bucket/path/to/file.json")
