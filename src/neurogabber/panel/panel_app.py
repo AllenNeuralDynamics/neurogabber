@@ -1,13 +1,40 @@
-import os, json, httpx, asyncio, re, panel as pn
+import os, json, httpx, asyncio, re, panel as pn, io
+from datetime import datetime
+from contextlib import contextmanager
 from panel.chat import ChatInterface
 from panel_neuroglancer import Neuroglancer
+import polars as pl
+import pandas as pd
+
+# Import pointer expansion functionality
+from neurogabber.backend.tools.pointer_expansion import (
+    expand_if_pointer_and_generate_inline,
+    is_pointer_url
+)
+
+# setup debug logging
+import logging
+FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+def reconfig_basic_config(format_=FORMAT, level=logging.INFO):
+    """(Re-)configure logging"""
+    logging.basicConfig(format=format_, level=level, force=True)
+    logging.info("Logging.basicConfig completed successfully")
+
+reconfig_basic_config()
+logger = logging.getLogger(name="app")
 
 # get version from package metadata init
 from importlib.metadata import version
 version = version("neurogabber")
-pn.config.theme = 'dark'
-pn.extension()  # enable the neuroglancer extension
-pn.extension(theme='dark')
+pn.extension(
+    'tabulator',
+    'filedropper',
+    'floatpanel',
+    theme='dark',
+    css_files=[
+        "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css"
+    ],
+)
 
 BACKEND = os.environ.get("BACKEND", "http://127.0.0.1:8000")
 
@@ -17,90 +44,172 @@ status = pn.pane.Markdown("Ready.")
 # Track last loaded Neuroglancer URL (dedupe reloads)
 last_loaded_url: str | None = None
 
-# Tools that mutate the shared Neuroglancer state; if any run we should refresh viewer
-MUTATING_TOOLS = {
-    "ng_set_view",
-    "ng_set_lut",
-    "ng_annotations_add",
-    "state_load",            # replaces entire state
-    "data_ingest_csv_rois",  # may add an annotation layer
-}
+# Mutation detection now handled server-side; state link returned directly when mutated.
 
 # Settings widgets
 auto_load_checkbox = pn.widgets.Checkbox(name="Auto-load view", value=True)
 latest_url = pn.widgets.TextInput(name="Latest NG URL", value="", disabled=True)
+update_state_interval = pn.widgets.IntInput(name="Update state interval (sec)", value=5, start=1)
+trace_history_checkbox = pn.widgets.Checkbox(name="Trace history", value=True)
+trace_history_length = pn.widgets.IntInput(name="History N", value=5)
+trace_download = pn.widgets.FileDownload(label="Download traces", filename="trace_history.json", button_type="primary", disabled=True)
+_trace_history: list[dict] = []
+_recent_traces_view = pn.pane.Markdown("No traces yet.", sizing_mode="stretch_width")
+_recent_traces_accordion = pn.Accordion(("Recent Traces", _recent_traces_view), active=[])
+ng_links_internal = pn.widgets.Checkbox(name="NG links open internal", value=True)
+views_table = pn.widgets.Tabulator(pd.DataFrame(), disabled=True, height=250, visible=False)
+# NOTE: Tabulator expects a pandas.DataFrame. Do NOT pass a polars DataFrame or a class placeholder.
+# Always convert upstream objects (lists of dicts, polars.DataFrame) to pandas before assignment.
+
+# Track whether we've already added the row selection watcher to avoid inspecting internal watcher structures.
+_views_table_watcher_added = False
+
+# --- Debounce & programmatic load tracking state ---
+_programmatic_load: bool = False  # True while we intentionally set viewer.url in code
+_last_user_state_sync: float = 0.0  # monotonic time of last backend sync caused by user interaction
+_scheduled_user_state_task: asyncio.Task | None = None  # pending delayed sync task
+
+@contextmanager
+def _programmatic_viewer_update():
+    """Context manager marking a viewer.url change as programmatic.
+
+    Programmatic (agent / app) initiated changes should sync immediately and not
+    be throttled/debounced like rapid manual user edits in the Neuroglancer UI.
+    """
+    global _programmatic_load
+    _programmatic_load = True
+    try:
+        yield
+    finally:
+        _programmatic_load = False
 
 def _open_latest(_):
     if latest_url.value:
-        viewer.url = latest_url.value
+        with _programmatic_viewer_update():
+            viewer.url = latest_url.value
 
 open_latest_btn = pn.widgets.Button(name="Open latest link", button_type="primary")
 open_latest_btn.on_click(_open_latest)
 
 async def _notify_backend_state_load(url: str):
-    """Inform backend that the widget loaded a new NG URL so CURRENT_STATE is in sync."""
+    """Inform backend that the widget loaded a new NG URL so CURRENT_STATE is in sync.
+    
+    If URL contains a JSON pointer, expand it first before syncing to backend.
+    """
     try:
         status.object = "Syncing state to backend…"
+        
+        # Check if URL contains a pointer and expand if needed
+        sync_url = url
+        if is_pointer_url(url):
+            try:
+                status.object = "Expanding JSON pointer…"
+                canonical_url, state_dict, was_pointer = expand_if_pointer_and_generate_inline(url)
+                if was_pointer:
+                    sync_url = canonical_url
+                    status.object = "Pointer expanded, syncing state…"
+            except Exception as e:
+                status.object = f"Pointer expansion failed: {e}"
+                # Fall back to syncing original URL
+                sync_url = url
+        
         async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(f"{BACKEND}/tools/state_load", json={"link": url})
+            resp = await client.post(f"{BACKEND}/tools/state_load", json={"link": sync_url})
             data = resp.json()
             if not data.get("ok"):
                 status.object = f"Error syncing link: {data.get('error', 'unknown error')}"
                 return
-        status.object = f"**Opened:** {url}"
+        status.object = f"**Opened:** {sync_url}"
     except Exception as e:
         status.object = f"Error syncing: {e}"
 
 def _on_url_change(event):
-    # Called when the widget loads Demo or a user URL, or when we set viewer.url
+    """Handle Neuroglancer URL changes with pointer expansion and debouncing."""
     new_url = event.new
     if not new_url:
         return
-    asyncio.create_task(_notify_backend_state_load(new_url))
+    
+    # Immediate path for programmatic updates
+    if _programmatic_load:
+        asyncio.create_task(_handle_url_change_immediate(new_url))
+        return
+    
+    # Debounce user-driven changes
+    global _last_user_state_sync, _scheduled_user_state_task
+    loop = asyncio.get_event_loop()
+    now = loop.time()
+    
+    try:
+        interval = max(1, int(update_state_interval.value or 5))
+    except Exception:
+        interval = 5
+    
+    elapsed = now - _last_user_state_sync
+    if elapsed >= interval:
+        _last_user_state_sync = now
+        asyncio.create_task(_handle_url_change_immediate(new_url))
+    else:
+        # Schedule one future call if not already scheduled
+        if _scheduled_user_state_task is None or _scheduled_user_state_task.done():
+            delay = interval - elapsed
+            async def _delayed_sync():
+                await asyncio.sleep(delay)
+                cur = viewer.url
+                if cur:
+                    global _last_user_state_sync
+                    _last_user_state_sync = loop.time()
+                    await _handle_url_change_immediate(cur)
+            _scheduled_user_state_task = asyncio.create_task(_delayed_sync())
+
+async def _handle_url_change_immediate(url: str):
+    """Handle URL change immediately with pointer expansion and viewer update."""
+    try:
+        # Check if URL contains a pointer and expand if needed
+        if is_pointer_url(url):
+            canonical_url, state_dict, was_pointer = expand_if_pointer_and_generate_inline(url)
+            if was_pointer:
+                # Update viewer with canonical URL to avoid re-triggering
+                with _programmatic_viewer_update():
+                    viewer.url = canonical_url
+                # Sync the expanded state
+                await _notify_backend_state_load(canonical_url)
+                return
+        
+        # Regular URL handling
+        await _notify_backend_state_load(url)
+    except Exception as e:
+        status.object = f"URL handling error: {e}"
+        # Fallback: try to sync original URL
+        await _notify_backend_state_load(url)
 
 # Watch the Neuroglancer widget URL; use its built-in Demo/Load buttons
 viewer.param.watch(_on_url_change, 'url')
 async def agent_call(prompt: str) -> dict:
-    """Return {'answer': str|None, 'url': str|None, 'masked': str|None, 'tools': [str]}.
+    """Call backend iterative chat once; backend executes tools.
 
-    Execute tool calls then fetch current masked link via ng_state_link (no
-    persistence). Include executed tool names so caller can decide whether to
-    auto-load the viewer based on mutation.
+    Returns:
+      answer: final assistant message
+      mutated: bool indicating any mutating tool executed server-side
+      url/masked: Neuroglancer link info if mutated (present only when mutated)
     """
-    async with httpx.AsyncClient(timeout=60) as client:
-        chat = {"messages": [{"role": "user", "content": prompt}]}
-        resp = await client.post(f"{BACKEND}/agent/chat", json=chat)
+    async with httpx.AsyncClient(timeout=120) as client:
+        chat_payload = {"messages": [{"role": "user", "content": prompt}]}
+        resp = await client.post(f"{BACKEND}/agent/chat", json=chat_payload)
         data = resp.json()
-
         answer = None
-        tool_calls = []
-        for choice in (data.get("choices") or []):
-            msg = choice.get("message", {})
-            if msg.get("content"):
-                answer = msg["content"]
-            for tc in (msg.get("tool_calls") or []):
-                tool_calls.append(tc)
-
-        if not tool_calls:
-            # Conversational: no state change
-            return {"answer": answer or "(no response)", "url": None, "masked": None}
-
-        # Execute tool calls sequentially
-        executed = []
-        for tc in tool_calls:
-            name = tc["function"]["name"]
-            args = json.loads(tc["function"]["arguments"] or "{}")
-            await client.post(f"{BACKEND}/tools/{name}", json=args)
-            executed.append(name)
-
-        # Fetch current masked link (no persistence) after mutations BEFORE closing client
-        link_resp = await client.post(f"{BACKEND}/tools/ng_state_link")
-        link_data = link_resp.json()
+        if data.get("choices"):
+            msg = data["choices"][0].get("message", {})
+            answer = msg.get("content")
+        mutated = bool(data.get("mutated"))
+        state_link = data.get("state_link") or {}
+        tool_trace = data.get("tool_trace") or []
         return {
-            "answer": answer,
-            "url": link_data.get("url"),
-            "masked": link_data.get("masked_markdown"),
-            "tools": executed,
+            "answer": answer or "(no response)",
+            "mutated": mutated,
+            "url": state_link.get("url"),
+            "masked": state_link.get("masked_markdown"),
+            "tool_trace": tool_trace,
+            "views_table": data.get("views_table"),
         }
 
 def _mask_client_side(text: str) -> str:
@@ -119,75 +228,167 @@ def _mask_client_side(text: str) -> str:
     return url_pattern.sub(repl, text)
 
 
+def _load_internal_link(url: str):
+    if not url:
+        return
+    with _programmatic_viewer_update():
+        viewer.url = url
+        viewer._load_url()
+    # Sync handled by _on_url_change in programmatic context
+
 async def respond(contents: str, user: str, **kwargs):
-    global last_loaded_url
+    global last_loaded_url, _trace_history
     status.object = "Running…"
     try:
         result = await agent_call(contents)
         link = result.get("url")
-        executed = set(result.get("tools") or [])
-        mutated = bool(executed & MUTATING_TOOLS)
+        mutated = bool(result.get("mutated"))
         safe_answer = _mask_client_side(result.get("answer")) if result.get("answer") else None
+        trace = result.get("tool_trace") or []
+        vt = result.get("views_table")
+        if trace:
+            # Build concise status line of executed tool names in order
+            tool_names = [t.get("tool") or t.get("name") for t in trace if t]
+            if tool_names:
+                status.object = f"Tools: {' → '.join(tool_names)}"
 
-        if link:
-            latest_url.value = link or ""
+        # Optional trace history retrieval
+        if trace_history_checkbox.value:
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    hist_resp = await client.get(f"{BACKEND}/debug/tool_trace", params={"n": trace_history_length.value})
+                hist_data = hist_resp.json()
+                _trace_history = hist_data.get("traces", [])
+                if _trace_history:
+                    def _payload():
+                        payload = {
+                            "exported_at": datetime.utcnow().isoformat() + 'Z',
+                            "count": len(_trace_history),
+                            "traces": _trace_history,
+                        }
+                        return io.BytesIO(json.dumps(payload, indent=2).encode('utf-8'))
+                    trace_download.callback = _payload
+                    ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+                    trace_download.filename = f"trace_history_{ts}.json"
+                    trace_download.disabled = False
+                    # Update recent traces markdown (summaries only)
+                    lines: list[str] = []
+                    for i, t in enumerate(reversed(_trace_history), start=1):
+                        steps = t.get("steps", [])
+                        tool_chain = " → ".join(s.get("tool") for s in steps if s.get("tool"))
+                        mutated_flag = "✅" if t.get("mutated") else "–"
+                        final_msg = (t.get("final_message", {}).get("content") or "").strip()
+                        final_msg = final_msg[:120] + ("…" if len(final_msg) > 120 else "")
+                        lines.append(f"**{i}.** {mutated_flag} {tool_chain or '(no tools)'}\n> {final_msg}")
+                    if lines:
+                        _recent_traces_view.object = "\n\n".join(lines)
+                        _recent_traces_accordion.active = [0]
+                    else:
+                        _recent_traces_view.object = "No traces yet."
+            except Exception as e:  # pragma: no cover
+                status.object += f" | Trace err: {e}"
+
+        # Render multi-view table if present
+        # If multi-view tool returned an error, surface it clearly (and any warnings)
+        if vt and isinstance(vt, dict) and vt.get("error"):
+            warn_txt = ""
+            if vt.get("warnings"):
+                warn_txt = "\n\nWarnings:\n- " + "\n- ".join(vt.get("warnings") or [])
+            status.object = f"Multi-view error: {vt.get('error')}{warn_txt}"
+        embedded_table_component = None
+        # Render multi-view table if present and successful
+        if vt and isinstance(vt, dict) and vt.get("rows"):
+            rows = vt["rows"]
+            # Build DataFrame-like structure for Tabulator. Hide raw link column, show masked_link clickable.
+            import pandas as pd
+            df_rows = []
+            for r in rows:
+                display = {k: v for k, v in r.items() if k not in ("link", "masked_link")}
+                raw = r.get("link")
+                # Provide a simple HTML anchor; Tabulator with html=True will render it.
+                if raw:
+                    display["view"] = f"<a href='{raw}' target='_blank'>link</a>"
+                df_rows.append(display)
+            if df_rows:
+                views_table.value = pd.DataFrame(df_rows)
+                views_table.visible = True
+                views_table.disabled = False
+                # Configure columns (if available) to allow HTML rendering
+                try:
+                    views_table.formatters = {"view": {"type": "html"}}
+                except Exception:
+                    pass
+                # Create a lightweight embedded table (copy) for chat message rendering
+                embedded_table_component = pn.widgets.Tabulator(
+                    views_table.value.copy(), height=220, disabled=True, selectable=False, pagination=None
+                )
+                try:
+                    embedded_table_component.formatters = {"view": {"type": "html"}}
+                except Exception:
+                    pass
+                # Add click behavior: when selecting a row, open link
+                def _on_select(event):  # pragma: no cover UI callback
+                    if not ng_links_internal.value:
+                        return
+                    try:
+                        data = views_table.value
+                        if data is not None and hasattr(data, "index") and len(data.index) > 0 and event.new:
+                            idxs = event.new
+                            if isinstance(idxs, list) and idxs:
+                                # Reconstruct raw link from view cell href if needed
+                                href = data.iloc[idxs[0]].get("view")
+                                if isinstance(href, str) and "href='" in href:
+                                    try:
+                                        raw_link = href.split("href='",1)[1].split("'",1)[0]
+                                        _load_internal_link(raw_link)
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+                global _views_table_watcher_added
+                if not _views_table_watcher_added:
+                    try:
+                        views_table.param.watch(_on_select, 'selection')
+                        _views_table_watcher_added = True
+                    except Exception:
+                        # Fallback: silently ignore if watcher cannot be set (should not happen normally)
+                        pass
+            # Auto-load first link if auto-load enabled
+            if ng_links_internal.value and auto_load_checkbox.value and rows:
+                _load_internal_link(rows[0].get("link"))
+
+        if mutated and link and not vt:  # avoid duplicate load after views_table logic
+            latest_url.value = link
             masked = result.get("masked") or f"[Updated Neuroglancer view]({link})"
-            if mutated:
-                if link != last_loaded_url:
-                    if auto_load_checkbox.value:
+            if link != last_loaded_url:
+                if auto_load_checkbox.value:
+                    with _programmatic_viewer_update():
                         viewer.url = link
                         viewer._load_url()
-                        last_loaded_url = link
-                        status.object = f"**Opened:** {link}"
-                    else:
-                        status.object = "New link generated (auto-load off)."
+                    last_loaded_url = link
+                    status.object = f"**Opened:** {link}"
                 else:
-                    status.object = "State updated (no link change)."
+                    status.object = "New link generated (auto-load off)."
             else:
-                status.object = "Completed (no view change)."
-
+                status.object = "State updated (no link change)."
             if safe_answer:
                 return f"{safe_answer}\n\n{masked}"
             return masked
         else:
-            status.object = "Done."
+            if not trace:
+                status.object = "Done (no view change)."
+            # If we have an embedded table, return a structured chat message containing both text & component
+            if embedded_table_component is not None:
+                # Wrap answer + table in a single Column so ChatInterface doesn't display list repr.
+                if safe_answer:
+                    return pn.Column(pn.pane.Markdown(safe_answer), embedded_table_component, sizing_mode="stretch_width")
+                return pn.Column(embedded_table_component, sizing_mode="stretch_width")
             return safe_answer if safe_answer else "(no response)"
     except Exception as e:
         status.object = f"Error: {e}"
         return f"Error: {e}"
-    
-# async def agent_call(prompt: str) -> str:
-#     """Send prompt to FastAPI agent, execute tool calls, return final NG state URL."""
-#     async with httpx.AsyncClient(timeout=60) as client:
-#         # 1) Ask the agent for tool calls
-#         chat = {"messages": [{"role": "user", "content": prompt}]}
-#         resp = await client.post(f"{BACKEND}/agent/chat", json=chat)
-#         data = resp.json()
 
-#         # 2) Execute tool calls
-#         for choice in (data.get("choices") or []):
-#             msg = choice.get("message", {})
-#             for tc in (msg.get("tool_calls") or []):
-#                 name = tc["function"]["name"]
-#                 args = json.loads(tc["function"]["arguments"] or "{}")
-#                 await client.post(f"{BACKEND}/tools/{name}", json=args)
-
-#         # 3) Save state and return URL
-#         save = await client.post(f"{BACKEND}/tools/state_save", json={})
-#         return save.json()["url"]
-
-# async def respond(contents: str, user: str, **kwargs):
-#     """Async callback works natively on Panel 1.7.5."""
-#     status.object = "Running…"
-#     try:
-#         url = await agent_call(contents)
-#         viewer.source = url
-#         status.object = f"**Opened:** {url}"
-#         return f"Updated Neuroglancer view.\n\n{url}"
-#     except Exception as e:
-#         status.object = f"Error: {e}"
-#         return f"Error: {e}"
-
+# ---------------- Chat UI ----------------
 chat = ChatInterface(
     user="User",
     avatar="👤",
@@ -195,73 +396,252 @@ chat = ChatInterface(
     show_activity_dot=True,
     callback=respond,         # async callback
     height=1000,
-    #buttons
     show_button_name=False,
-    # chat ui
     show_avatar=False,
     show_reaction_icons=False,
     show_copy_icon=False,
     show_timestamp=False,
     widgets=[
-        pn.chat.ChatAreaInput(placeholder="Enter some text to get a count!"),
-        pn.widgets.FileInput(name="CSV File", accept=".csv"),
+        pn.chat.ChatAreaInput(placeholder="Ask a question or issue a command..."),
     ],
-    # message styles
-    message_params={   
-         # .meta { display: none; }
-         #             .avatar { display: none; }
-         #center { min-height: 30px; background-color: lightgrey; }
-         #.left { width: 2px; height: 2px; }
-         #.avatar { width: 5px; height: 5px; min-width: 5px; min-height: 5px; }
-         #.right{ background-color: red; }
-         #.meta { display: none; height: 0px; }
+    message_params={
         "stylesheets": [
             """
             .message {
                 font-size: 1em;
-
                 padding: 4px;
             }
-            .name {
-                font-size: 0.9em;
-            }
-            .timestamp {
-                font-size: 0.9em;
-            }
-            
-            
+            .name { font-size: 0.9em; }
+            .timestamp { font-size: 0.9em; }
             """
         ]
      }
 )
 
+# ---------------- Settings UI ----------------
 settings_card = pn.Card(
-    pn.Column(auto_load_checkbox, latest_url, open_latest_btn, status),
+    pn.Column(
+        auto_load_checkbox,
+        latest_url,
+        open_latest_btn,
+        ng_links_internal,
+        update_state_interval,
+        trace_history_checkbox,
+        trace_history_length,
+        trace_download,
+        _recent_traces_accordion,
+        status,
+    ),
     title="Settings",
     collapsed=False,
 )
 
+# ---------------- Data Upload & Summaries UI ----------------
+# NOTE: We keep upload + table refresh synchronous to avoid early event-loop timing issues
+# during Panel server warm start on some platforms (Windows). Async is still used for
+# LLM/chat + state sync, but simple data listing uses blocking httpx calls.
+file_drop = pn.widgets.FileDropper(name="Drop CSV files here", multiple=True, accepted_filetypes=["text/csv", ".csv"],sizing_mode="stretch_width")
+upload_notice = pn.pane.Markdown("")
+try:
+    import pandas as pd
+except Exception:  # pragma: no cover
+    pd = None
+
+if pd is not None:
+    uploaded_table = pn.widgets.Tabulator(
+        pd.DataFrame(columns=["file_id","name","size","n_rows","n_cols"]),
+        height=0,  # start collapsed until data present
+        disabled=True,
+        show_index=False,
+        buttons={
+            'preview': "<i class='fa fa-eye' title='Preview file'></i>",
+        },
+    )
+    summaries_table = pn.widgets.Tabulator(
+        pd.DataFrame(columns=["summary_id","source_file_id","kind","n_rows","n_cols"]),
+        height=0,
+        disabled=True,
+        show_index=False,
+    )
+else:
+    uploaded_table = pn.pane.Markdown("pandas not available")
+    summaries_table = pn.pane.Markdown("pandas not available")
+
+# Helper to update upload card title with dynamic file count
+def _update_upload_card_title(n: int):
+    try:
+        label = "file" if n == 1 else "files"
+        upload_card.title = f"Data Upload (📁 {n} {label})"
+    except Exception:
+        # Fallback silently; title update is non-critical
+        pass
+
+def _refresh_files():
+    if pd is None:
+        return
+    try:
+        with httpx.Client(timeout=30) as client:
+            lst = client.post(f"{BACKEND}/tools/data_list_files")
+            data = lst.json().get("files", [])
+        _update_upload_card_title(len(data))
+        if data:
+            df = pd.DataFrame(data)
+            # Reorder with name first, keep file_id (hidden) at end for potential future use
+            desired = [c for c in ["name","size","n_rows","n_cols","file_id"] if c in df.columns]
+            df = df[desired]
+            # Rename display columns
+            rename_map = {"name":"Name","size":"Size","n_rows":"Rows","n_cols":"Cols"}
+            df = df.rename(columns=rename_map)
+            uploaded_table.value = df
+            # Hide file_id if present
+            hidden_cols = [c for c in ["file_id"] if c in df.columns]
+            if hidden_cols:
+                uploaded_table.hidden_columns = hidden_cols
+            # Dynamic height: ~40px per row (estimated row height incl. header). Cap at 5 rows.
+            n_rows = len(df)
+            per = 50
+            cap = 10
+            shown = min(n_rows, cap)
+            uploaded_table.height =  (shown * per) + 40  # extra for header
+            if n_rows > cap:
+                uploaded_table.scroll = True
+            else:
+                uploaded_table.scroll = False
+            uploaded_table.visible = True
+        else:
+            # Empty: collapse table height & clear
+            uploaded_table.value = pd.DataFrame(columns=["Name","Size","Rows","Cols"])
+            uploaded_table.height = 0
+            uploaded_table.visible = False
+    except Exception as e:  # pragma: no cover
+        upload_notice.object = f"File list error: {e}"
+        _update_upload_card_title(0)
+
+def _refresh_summaries():
+    if pd is None:
+        return
+    try:
+        with httpx.Client(timeout=30) as client:
+            lst = client.post(f"{BACKEND}/tools/data_list_summaries")
+            data = lst.json().get("summaries", [])
+        if data:
+            df = pd.DataFrame(data)
+            # Reorder with kind first; retain IDs (hidden) for possible referencing
+            desired_order = [c for c in ["kind","n_rows","n_cols","summary_id","source_file_id"] if c in df.columns]
+            df = df[desired_order]
+            rename_map = {"kind":"Kind","n_rows":"Rows","n_cols":"Cols"}
+            df = df.rename(columns=rename_map)
+            summaries_table.value = df
+            hidden_cols = [c for c in ["summary_id","source_file_id"] if c in df.columns]
+            if hidden_cols:
+                summaries_table.hidden_columns = hidden_cols
+            n_rows = len(df)
+            per = 40
+            cap = 5
+            shown = min(n_rows, cap)
+            summaries_table.height = (shown * per) + 40
+            if n_rows > cap:
+                summaries_table.scroll = True
+            else:
+                summaries_table.scroll = False
+            summaries_table.visible = True
+        else:
+            summaries_table.value = pd.DataFrame(columns=["Kind","Rows","Cols"])
+            summaries_table.height = 0
+            summaries_table.visible = False
+    except Exception as e:  # pragma: no cover
+        upload_notice.object = f"Summary list error: {e}"
+
+def _handle_file_upload(evt):
+    files = evt.new or {}
+    if not files:
+        return
+    msgs: list[str] = []
+    # FileDropper provides mapping name -> bytes
+    with httpx.Client(timeout=60) as client:
+        for name, raw in files.items():
+            try:
+                # Some widgets may give dicts with 'content' or 'body'
+                if isinstance(raw, dict):
+                    raw_bytes = raw.get("content") or raw.get("body") or b""
+                else:
+                    raw_bytes = raw
+                resp = client.post(
+                    f"{BACKEND}/upload_file",
+                    files={"file": (name, raw_bytes, "text/csv")},
+                )
+                rj = resp.json()
+
+                # dont show response here
+                # if rj.get("ok"):
+                #     msgs.append(f"✅ {name} → {rj['file']['file_id']}")
+                # else:
+                #     msgs.append(f"❌ {name} error: {rj.get('error')}")
+            except Exception as e:  # pragma: no cover
+                msgs.append(f"❌ {name} exception: {e}")
+    upload_notice.object = "\n".join(msgs)
+    _refresh_files()
+    _refresh_summaries()
+
+file_drop.param.watch(_handle_file_upload, "value")
+
+def _initial_refresh():
+    _refresh_files()
+    _refresh_summaries()
 
 upload_card = pn.Card(
     pn.Column(
-        pn.widgets.FileInput(name="CSV File", accept=".csv"),
-        pn.widgets.Button(name="Upload", button_type="primary"),
+        file_drop,
+        upload_notice,
+        #pn.pane.Markdown("**Uploaded Files**"),
+        uploaded_table,
+        #pn.pane.Markdown("**Summaries**"),
+        #summaries_table,
     ),
-    title="Upload",
-    collapsed=True,
-    # fill_space=True,
+    title="Data Upload",
+    collapsed=False,
     width=450,
 )
 
+# Initialize title with zero count until first refresh occurs
+_update_upload_card_title(0)
 
+
+workspace_body = pn.Column(
+    pn.pane.Markdown("### Workspace\n_Add notes, context, or future controls here._"),
+    sizing_mode="stretch_width",
+    scroll=True,
+)
+# Constrain height to 400px with scrolling inside
+workspace_card = pn.Card(
+    workspace_body,
+    title="Workspace",
+    collapsed=True,
+    sizing_mode="stretch_width",
+    styles={"maxHeight": "400px", "overflow": "auto"},
+)
 app = pn.template.FastListTemplate(
     title=f"Neurogabber v {version}",
-    sidebar=[upload_card,chat],
+    sidebar=[upload_card,chat], #views_table (dont need below)
     right_sidebar=settings_card,
     collapsed_right_sidebar = True,
-    main=[viewer],
+    main=[workspace_card, viewer],
     sidebar_width=450,
     theme="dark",
 )
 
 app.servable()
+
+
+# prompt inject example
+# pn.state.onload(_initial_refresh)
+
+# prompt_btn = pn.widgets.Button(name="Draft prompt for first file", button_type="primary")
+
+# def _inject_prompt(_):
+#     if pd is None: return
+#     if hasattr(uploaded_table, 'value') and not uploaded_table.value.empty:
+#         fid = uploaded_table.value.iloc[0]["file_id"]
+#         chat.send(f"Preview file {fid}")
+
+# prompt_btn.on_click(_inject_prompt)

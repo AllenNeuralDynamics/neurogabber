@@ -2,7 +2,10 @@ import os, json
 from typing import List, Dict
 from openai import OpenAI
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+_API_KEY = os.getenv("OPENAI_API_KEY")
+client = None
+if _API_KEY:
+  client = OpenAI(api_key=_API_KEY)
 
 SYSTEM_PROMPT = """
 You are Neurogabber, a helpful assistant for Neuroglancer.
@@ -14,6 +17,8 @@ Decision rules:
 - After performing modifications, if the user requests a link or updated view, call ng_state_link (NOT state_save) to return a masked markdown hyperlink. Only call state_save when explicit persistence is requested (e.g. 'save', 'persist', 'store').
 - Do not paste raw Neuroglancer URLs directly; always rely on ng_state_link for sharing the current view.
 
+Dataframe rules:
+- If the user wants a random sample, assume no seed, without replacement, and uniforming across all rows. Unless otherwise specificed. 
 Keep answers concise. Provide brief rationale before tool calls when helpful. Avoid redundant summaries."""
 
 # Define available tools (schemas must match your Pydantic models)
@@ -31,6 +36,42 @@ TOOLS = [
           "orientation": {"type":"string","enum":["xy","yz","xz","3d"]}
         },
         "required": ["center"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "ng_add_layer",
+      "description": "Add a new Neuroglancer layer (image, segmentation, or annotation). Idempotent if name exists.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string"},
+          "layer_type": {"type": "string", "enum": ["image","segmentation","annotation"], "default": "image"},
+          "source": {"description": "Layer source spec (string or object, passed through)", "oneOf": [
+            {"type": "string"},
+            {"type": "object"},
+            {"type": "null"}
+          ]},
+          "visible": {"type": "boolean", "default": True}
+        },
+        "required": ["name"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "ng_set_layer_visibility",
+      "description": "Toggle visibility of an existing layer (adds 'visible' key if missing).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string"},
+          "visible": {"type": "boolean"}
+        },
+        "required": ["name","visible"]
       }
     }
   },
@@ -110,13 +151,155 @@ TOOLS = [
   {"type":"function","function": {"name":"ng_state_link","description":"Return current state Neuroglancer link plus masked markdown hyperlink (use after modifications when user requests link).","parameters":{"type":"object","properties":{}}}}
 ]
 
+# Data tools appended
+DATA_TOOLS = [
+  {
+    "type": "function",
+    "function": {
+      "name": "data_list_files",
+      "description": "List uploaded CSV files with metadata (ids, columns).",
+      "parameters": {"type": "object", "properties": {}}
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "data_sample",
+      "description": "Return a random sample of rows from a dataframe (without replacement by default). Use to inspect a subset before analysis.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file_id": {"type": "string"},
+          "n": {"type": "integer", "default": 5, "minimum": 1, "maximum": 1000},
+          "seed": {"type": ["integer", "null"], "description": "Optional seed for reproducibility"},
+          "replace": {"type": "boolean", "default": False}
+        },
+        "required": ["file_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "data_ng_views_table",
+      "description": "Generate multiple Neuroglancer view links from a dataframe (e.g., top N by a metric) returning a table of id + metrics + links. Mutates state to first view.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file_id": {"type": "string", "description": "Source file id (provide either file_id OR summary_id)"},
+          "summary_id": {"type": "string", "description": "Existing summary/derived table id (mutually exclusive with file_id)"},
+          "sort_by": {"type": "string"},
+          "descending": {"type": "boolean", "default": True},
+          "top_n": {"type": "integer", "default": 5, "minimum": 1, "maximum": 50},
+          "id_column": {"type": "string", "default": "cell_id"},
+          "center_columns": {"type": "array", "items": {"type": "string"}, "default": ["x","y","z"]},
+          "include_columns": {"type": "array", "items": {"type": "string"}},
+          "lut": {"type": "object", "properties": {"layer": {"type": "string"}, "min": {"type": "number"}, "max": {"type": "number"}}},
+          "annotations": {"type": "boolean", "default": False},
+          "link_label_column": {"type": "string"}
+        },
+        # Note: cannot express mutual exclusivity without oneOf (disallowed by OpenAI);
+        # model should infer to supply only one of file_id or summary_id.
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "data_info",
+      "description": "Return dataframe metadata (rows, cols, columns, dtypes, head sample). Call before asking questions about the dataset.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file_id": {"type": "string"},
+          "sample_rows": {"type": "integer", "default": 5, "minimum": 1, "maximum": 20}
+        },
+        "required": ["file_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "data_preview",
+      "description": "Preview first N rows of a file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file_id": {"type": "string"},
+          "n": {"type": "integer", "default": 10, "minimum": 1, "maximum": 100}
+        },
+        "required": ["file_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "data_describe",
+      "description": "Compute numeric summary statistics for a file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file_id": {"type": "string"}
+        },
+        "required": ["file_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "data_select",
+      "description": "Select subset of columns and filtered rows; stores as summary table.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file_id": {"type": "string"},
+          "columns": {"type": "array", "items": {"type": "string"}},
+          "filters": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "column": {"type": "string"},
+                "op": {"type": "string", "enum": ["==","!=",">","<",">=","<="]},
+                "value": {}
+              },
+              "required": ["column", "op", "value"]
+            }
+          },
+          "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 500}
+        },
+        "required": ["file_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "data_list_summaries",
+      "description": "List previously created summary / derived tables.",
+      "parameters": {"type": "object", "properties": {}}
+    }
+  },
+]
+
+TOOLS = TOOLS + DATA_TOOLS
+
 
 def run_chat(messages: List[Dict]) -> Dict:
-    resp = client.chat.completions.create(
-        #model="gpt-4o-mini",  # any tool-capable model
-        model="gpt-5-mini",  # any tool-capable model
-        messages=messages,
-        tools=TOOLS,
-        tool_choice="auto"
-    )
-    return resp.model_dump()
+  if client is None:
+    # Fallback mock response for test environments without API key.
+    # Return structure mimicking OpenAI response with no tool calls so logic can proceed.
+    return {
+      "choices": [{"index": 0, "message": {"role": "assistant", "content": "(LLM disabled: no OPENAI_API_KEY set)"}}],
+      "usage": {}
+    }
+  resp = client.chat.completions.create(
+    model="gpt-5-nano",  # any tool-capable model
+    messages=messages,
+    tools=TOOLS,
+    tool_choice="auto"
+  )
+  return resp.model_dump()

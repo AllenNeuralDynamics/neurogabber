@@ -1,17 +1,17 @@
-from neurogabber.backend.tools.neuroglancer_state import new_state, set_view, set_lut, add_annotations
+from neurogabber.backend.tools.neuroglancer_state import NeuroglancerState
 
 
 def test_set_view_updates_position_and_scale():
-    s = new_state()
-    s2 = set_view(s, {"x": 5, "y": 6, "z": 7}, "fit", "xy")
-    assert s2["position"] == [5, 6, 7]
-    assert s2["crossSectionScale"] == 1.0
+    s = NeuroglancerState()
+    s.set_view({"x": 5, "y": 6, "z": 7}, "fit", "xy")
+    data = s.as_dict()
+    assert data["position"][:3] == [5, 6, 7]
+    assert data["crossSectionScale"] == 1.0
 
 
 def test_add_annotations_appends_items():
-    s = new_state()
-    add_annotations(
-        s,
+    s = NeuroglancerState()
+    s.add_annotations(
         "ROIs",
         [
             {"point": [1, 2, 3], "id": "a"},
@@ -19,14 +19,15 @@ def test_add_annotations_appends_items():
         ],
     )
     # Adding more should append
-    add_annotations(s, "ROIs", [{"point": [4, 5, 6]}])
-    ann_layers = [L for L in s["layers"] if L.get("type") == "annotation"]
+    s.add_annotations("ROIs", [{"point": [4, 5, 6]}])
+    data = s.as_dict()
+    ann_layers = [L for L in data["layers"] if L.get("type") == "annotation"]
     assert len(ann_layers) == 1
     anns = ann_layers[0]["source"]["annotations"]
     assert len(anns) == 3
 
 
 def test_set_lut_no_error_when_layer_missing():
-    s = new_state()
+    s = NeuroglancerState()
     # No exception if layer not present
-    set_lut(s, "missing", 0.0, 1.0)
+    s.set_lut("missing", 0.0, 1.0)
