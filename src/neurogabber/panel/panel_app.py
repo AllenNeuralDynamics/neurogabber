@@ -1,9 +1,16 @@
 import os, json, httpx, asyncio, re, panel as pn, io
 from datetime import datetime
+from contextlib import contextmanager
 from panel.chat import ChatInterface
 from panel_neuroglancer import Neuroglancer
 import polars as pl
 import pandas as pd
+
+# Import pointer expansion functionality
+from neurogabber.backend.tools.pointer_expansion import (
+    expand_if_pointer_and_generate_inline,
+    is_pointer_url
+)
 
 # setup debug logging
 import logging
@@ -42,6 +49,7 @@ last_loaded_url: str | None = None
 # Settings widgets
 auto_load_checkbox = pn.widgets.Checkbox(name="Auto-load view", value=True)
 latest_url = pn.widgets.TextInput(name="Latest NG URL", value="", disabled=True)
+update_state_interval = pn.widgets.IntInput(name="Update state interval (sec)", value=5, start=1)
 trace_history_checkbox = pn.widgets.Checkbox(name="Trace history", value=True)
 trace_history_length = pn.widgets.IntInput(name="History N", value=5)
 trace_download = pn.widgets.FileDownload(label="Download traces", filename="trace_history.json", button_type="primary", disabled=True)
@@ -56,33 +64,123 @@ views_table = pn.widgets.Tabulator(pd.DataFrame(), disabled=True, height=250, vi
 # Track whether we've already added the row selection watcher to avoid inspecting internal watcher structures.
 _views_table_watcher_added = False
 
+# --- Debounce & programmatic load tracking state ---
+_programmatic_load: bool = False  # True while we intentionally set viewer.url in code
+_last_user_state_sync: float = 0.0  # monotonic time of last backend sync caused by user interaction
+_scheduled_user_state_task: asyncio.Task | None = None  # pending delayed sync task
+
+@contextmanager
+def _programmatic_viewer_update():
+    """Context manager marking a viewer.url change as programmatic.
+
+    Programmatic (agent / app) initiated changes should sync immediately and not
+    be throttled/debounced like rapid manual user edits in the Neuroglancer UI.
+    """
+    global _programmatic_load
+    _programmatic_load = True
+    try:
+        yield
+    finally:
+        _programmatic_load = False
+
 def _open_latest(_):
     if latest_url.value:
-        viewer.url = latest_url.value
+        with _programmatic_viewer_update():
+            viewer.url = latest_url.value
 
 open_latest_btn = pn.widgets.Button(name="Open latest link", button_type="primary")
 open_latest_btn.on_click(_open_latest)
 
 async def _notify_backend_state_load(url: str):
-    """Inform backend that the widget loaded a new NG URL so CURRENT_STATE is in sync."""
+    """Inform backend that the widget loaded a new NG URL so CURRENT_STATE is in sync.
+    
+    If URL contains a JSON pointer, expand it first before syncing to backend.
+    """
     try:
         status.object = "Syncing state to backend…"
+        
+        # Check if URL contains a pointer and expand if needed
+        sync_url = url
+        if is_pointer_url(url):
+            try:
+                status.object = "Expanding JSON pointer…"
+                canonical_url, state_dict, was_pointer = expand_if_pointer_and_generate_inline(url)
+                if was_pointer:
+                    sync_url = canonical_url
+                    status.object = "Pointer expanded, syncing state…"
+            except Exception as e:
+                status.object = f"Pointer expansion failed: {e}"
+                # Fall back to syncing original URL
+                sync_url = url
+        
         async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(f"{BACKEND}/tools/state_load", json={"link": url})
+            resp = await client.post(f"{BACKEND}/tools/state_load", json={"link": sync_url})
             data = resp.json()
             if not data.get("ok"):
                 status.object = f"Error syncing link: {data.get('error', 'unknown error')}"
                 return
-        status.object = f"**Opened:** {url}"
+        status.object = f"**Opened:** {sync_url}"
     except Exception as e:
         status.object = f"Error syncing: {e}"
 
 def _on_url_change(event):
-    # Called when the widget loads Demo or a user URL, or when we set viewer.url
+    """Handle Neuroglancer URL changes with pointer expansion and debouncing."""
     new_url = event.new
     if not new_url:
         return
-    asyncio.create_task(_notify_backend_state_load(new_url))
+    
+    # Immediate path for programmatic updates
+    if _programmatic_load:
+        asyncio.create_task(_handle_url_change_immediate(new_url))
+        return
+    
+    # Debounce user-driven changes
+    global _last_user_state_sync, _scheduled_user_state_task
+    loop = asyncio.get_event_loop()
+    now = loop.time()
+    
+    try:
+        interval = max(1, int(update_state_interval.value or 5))
+    except Exception:
+        interval = 5
+    
+    elapsed = now - _last_user_state_sync
+    if elapsed >= interval:
+        _last_user_state_sync = now
+        asyncio.create_task(_handle_url_change_immediate(new_url))
+    else:
+        # Schedule one future call if not already scheduled
+        if _scheduled_user_state_task is None or _scheduled_user_state_task.done():
+            delay = interval - elapsed
+            async def _delayed_sync():
+                await asyncio.sleep(delay)
+                cur = viewer.url
+                if cur:
+                    global _last_user_state_sync
+                    _last_user_state_sync = loop.time()
+                    await _handle_url_change_immediate(cur)
+            _scheduled_user_state_task = asyncio.create_task(_delayed_sync())
+
+async def _handle_url_change_immediate(url: str):
+    """Handle URL change immediately with pointer expansion and viewer update."""
+    try:
+        # Check if URL contains a pointer and expand if needed
+        if is_pointer_url(url):
+            canonical_url, state_dict, was_pointer = expand_if_pointer_and_generate_inline(url)
+            if was_pointer:
+                # Update viewer with canonical URL to avoid re-triggering
+                with _programmatic_viewer_update():
+                    viewer.url = canonical_url
+                # Sync the expanded state
+                await _notify_backend_state_load(canonical_url)
+                return
+        
+        # Regular URL handling
+        await _notify_backend_state_load(url)
+    except Exception as e:
+        status.object = f"URL handling error: {e}"
+        # Fallback: try to sync original URL
+        await _notify_backend_state_load(url)
 
 # Watch the Neuroglancer widget URL; use its built-in Demo/Load buttons
 viewer.param.watch(_on_url_change, 'url')
@@ -133,9 +231,10 @@ def _mask_client_side(text: str) -> str:
 def _load_internal_link(url: str):
     if not url:
         return
-    viewer.url = url
-    viewer._load_url()
-    asyncio.create_task(_notify_backend_state_load(url))
+    with _programmatic_viewer_update():
+        viewer.url = url
+        viewer._load_url()
+    # Sync handled by _on_url_change in programmatic context
 
 async def respond(contents: str, user: str, **kwargs):
     global last_loaded_url, _trace_history
@@ -263,8 +362,9 @@ async def respond(contents: str, user: str, **kwargs):
             masked = result.get("masked") or f"[Updated Neuroglancer view]({link})"
             if link != last_loaded_url:
                 if auto_load_checkbox.value:
-                    viewer.url = link
-                    viewer._load_url()
+                    with _programmatic_viewer_update():
+                        viewer.url = link
+                        viewer._load_url()
                     last_loaded_url = link
                     status.object = f"**Opened:** {link}"
                 else:
@@ -320,8 +420,18 @@ chat = ChatInterface(
 
 # ---------------- Settings UI ----------------
 settings_card = pn.Card(
-    pn.Column(auto_load_checkbox, latest_url, open_latest_btn, ng_links_internal, 
-              trace_history_checkbox, trace_history_length, trace_download, _recent_traces_accordion, status),
+    pn.Column(
+        auto_load_checkbox,
+        latest_url,
+        open_latest_btn,
+        ng_links_internal,
+        update_state_interval,
+        trace_history_checkbox,
+        trace_history_length,
+        trace_download,
+        _recent_traces_accordion,
+        status,
+    ),
     title="Settings",
     collapsed=False,
 )

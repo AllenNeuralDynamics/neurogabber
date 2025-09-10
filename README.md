@@ -53,6 +53,11 @@ Alternatively, if using `uv`, run
 uv sync
 ```
 
+##
++ https://hemibrain-dot-neuroglancer-demo.appspot.com/#!gs://neuroglancer-janelia-flyem-hemibrain/v1.0/neuroglancer_demo_states/base.json
+https://aind-neuroglancer-sauujisjxq-uw.a.run.app/#!s3://aind-open-data/HCR_754803-03_2025-04-04_13-00-00/raw_data.json
+
+
 ## Features
 
 * Chat-driven Neuroglancer view manipulation via tool calls
