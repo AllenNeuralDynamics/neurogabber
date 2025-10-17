@@ -305,3 +305,79 @@ def run_chat(messages: List[Dict]) -> Dict:
     tool_choice="auto"
   )
   return resp.model_dump()
+
+
+def run_chat_stream(messages: List[Dict]):
+  """Stream chat completions token by token.
+  
+  Yields:
+    Dict with 'type' field indicating chunk type:
+    - {"type": "content", "delta": str} - text content chunk
+    - {"type": "tool_calls", "tool_calls": [...]} - complete tool calls
+    - {"type": "done", "message": dict, "usage": dict} - final message
+  """
+  if client is None:
+    yield {"type": "content", "delta": "(LLM disabled: no OPENAI_API_KEY set)"}
+    yield {"type": "done", "message": {"role": "assistant", "content": "(LLM disabled: no OPENAI_API_KEY set)"}, "usage": {}}
+    return
+    
+  stream = client.chat.completions.create(
+    model=MODEL,
+    messages=messages,
+    tools=TOOLS,
+    tool_choice="auto",
+    stream=True
+  )
+  
+  # Accumulate the full response as we stream
+  accumulated_content = ""
+  accumulated_tool_calls = []
+  final_message = {"role": "assistant"}
+  
+  for chunk in stream:
+    if not chunk.choices:
+      continue
+      
+    delta = chunk.choices[0].delta
+    finish_reason = chunk.choices[0].finish_reason
+    
+    # Stream content tokens
+    if delta.content:
+      accumulated_content += delta.content
+      yield {"type": "content", "delta": delta.content}
+    
+    # Accumulate tool calls (they come in pieces)
+    if delta.tool_calls:
+      for tc_delta in delta.tool_calls:
+        idx = tc_delta.index
+        # Ensure we have enough slots
+        while len(accumulated_tool_calls) <= idx:
+          accumulated_tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+        
+        if tc_delta.id:
+          accumulated_tool_calls[idx]["id"] = tc_delta.id
+        if tc_delta.function:
+          if tc_delta.function.name:
+            accumulated_tool_calls[idx]["function"]["name"] = tc_delta.function.name
+          if tc_delta.function.arguments:
+            accumulated_tool_calls[idx]["function"]["arguments"] += tc_delta.function.arguments
+    
+    # On finish, yield complete message
+    if finish_reason:
+      if accumulated_content:
+        final_message["content"] = accumulated_content
+      if accumulated_tool_calls:
+        final_message["tool_calls"] = accumulated_tool_calls
+        yield {"type": "tool_calls", "tool_calls": accumulated_tool_calls}
+      
+      # Get usage from final chunk if available
+      usage = {}
+      if hasattr(chunk, 'usage') and chunk.usage:
+        usage = {
+          "prompt_tokens": chunk.usage.prompt_tokens,
+          "completion_tokens": chunk.usage.completion_tokens,
+          "total_tokens": chunk.usage.total_tokens
+        }
+      
+      yield {"type": "done", "message": final_message, "usage": usage}
+      break

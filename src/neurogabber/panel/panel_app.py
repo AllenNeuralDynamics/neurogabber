@@ -237,131 +237,109 @@ def _load_internal_link(url: str):
     # Sync handled by _on_url_change in programmatic context
 
 async def respond(contents: str, user: str, **kwargs):
+    """Async generator that streams agent responses token by token."""
     global last_loaded_url, _trace_history
     status.object = "Running…"
-    try:
-        result = await agent_call(contents)
-        link = result.get("url")
-        mutated = bool(result.get("mutated"))
-        safe_answer = _mask_client_side(result.get("answer")) if result.get("answer") else None
-        trace = result.get("tool_trace") or []
-        vt = result.get("views_table")
-        if trace:
-            # Build concise status line of executed tool names in order
-            tool_names = [t.get("tool") or t.get("name") for t in trace if t]
-            if tool_names:
-                status.object = f"Tools: {' → '.join(tool_names)}"
-
-        # Optional trace history retrieval
-        if trace_history_checkbox.value:
-            try:
-                async with httpx.AsyncClient(timeout=30) as client:
-                    hist_resp = await client.get(f"{BACKEND}/debug/tool_trace", params={"n": trace_history_length.value})
-                hist_data = hist_resp.json()
-                _trace_history = hist_data.get("traces", [])
-                if _trace_history:
-                    def _payload():
-                        payload = {
-                            "exported_at": datetime.utcnow().isoformat() + 'Z',
-                            "count": len(_trace_history),
-                            "traces": _trace_history,
-                        }
-                        return io.BytesIO(json.dumps(payload, indent=2).encode('utf-8'))
-                    trace_download.callback = _payload
-                    ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-                    trace_download.filename = f"trace_history_{ts}.json"
-                    trace_download.disabled = False
-                    # Update recent traces markdown (summaries only)
-                    lines: list[str] = []
-                    for i, t in enumerate(reversed(_trace_history), start=1):
-                        steps = t.get("steps", [])
-                        tool_chain = " → ".join(s.get("tool") for s in steps if s.get("tool"))
-                        mutated_flag = "✅" if t.get("mutated") else "–"
-                        final_msg = (t.get("final_message", {}).get("content") or "").strip()
-                        final_msg = final_msg[:120] + ("…" if len(final_msg) > 120 else "")
-                        lines.append(f"**{i}.** {mutated_flag} {tool_chain or '(no tools)'}\n> {final_msg}")
-                    if lines:
-                        _recent_traces_view.object = "\n\n".join(lines)
-                        _recent_traces_accordion.active = [0]
-                    else:
-                        _recent_traces_view.object = "No traces yet."
-            except Exception as e:  # pragma: no cover
-                status.object += f" | Trace err: {e}"
-
-        # Render multi-view table if present
-        # If multi-view tool returned an error, surface it clearly (and any warnings)
-        if vt and isinstance(vt, dict) and vt.get("error"):
-            warn_txt = ""
-            if vt.get("warnings"):
-                warn_txt = "\n\nWarnings:\n- " + "\n- ".join(vt.get("warnings") or [])
-            status.object = f"Multi-view error: {vt.get('error')}{warn_txt}"
-        embedded_table_component = None
-        # Render multi-view table if present and successful
-        if vt and isinstance(vt, dict) and vt.get("rows"):
-            rows = vt["rows"]
-            # Build DataFrame-like structure for Tabulator. Hide raw link column, show masked_link clickable.
-            import pandas as pd
-            df_rows = []
-            for r in rows:
-                display = {k: v for k, v in r.items() if k not in ("link", "masked_link")}
-                raw = r.get("link")
-                # Provide a simple HTML anchor; Tabulator with html=True will render it.
-                if raw:
-                    display["view"] = f"<a href='{raw}' target='_blank'>link</a>"
-                df_rows.append(display)
-            if df_rows:
-                views_table.value = pd.DataFrame(df_rows)
-                views_table.visible = True
-                views_table.disabled = False
-                # Configure columns (if available) to allow HTML rendering
-                try:
-                    views_table.formatters = {"view": {"type": "html"}}
-                except Exception:
-                    pass
-                # Create a lightweight embedded table (copy) for chat message rendering
-                embedded_table_component = pn.widgets.Tabulator(
-                    views_table.value.copy(), height=220, disabled=True, selectable=False, pagination=None
-                )
-                try:
-                    embedded_table_component.formatters = {"view": {"type": "html"}}
-                except Exception:
-                    pass
-                # Add click behavior: when selecting a row, open link
-                def _on_select(event):  # pragma: no cover UI callback
-                    if not ng_links_internal.value:
-                        return
-                    try:
-                        data = views_table.value
-                        if data is not None and hasattr(data, "index") and len(data.index) > 0 and event.new:
-                            idxs = event.new
-                            if isinstance(idxs, list) and idxs:
-                                # Reconstruct raw link from view cell href if needed
-                                href = data.iloc[idxs[0]].get("view")
-                                if isinstance(href, str) and "href='" in href:
-                                    try:
-                                        raw_link = href.split("href='",1)[1].split("'",1)[0]
-                                        _load_internal_link(raw_link)
-                                    except Exception:
-                                        pass
-                    except Exception:
-                        pass
-                global _views_table_watcher_added
-                if not _views_table_watcher_added:
-                    try:
-                        views_table.param.watch(_on_select, 'selection')
-                        _views_table_watcher_added = True
-                    except Exception:
-                        # Fallback: silently ignore if watcher cannot be set (should not happen normally)
-                        pass
-            # Auto-load first link if auto-load enabled
-            if ng_links_internal.value and auto_load_checkbox.value and rows:
-                _load_internal_link(rows[0].get("link"))
-
-        if mutated and link and not vt:  # avoid duplicate load after views_table logic
-            latest_url.value = link
-            masked = result.get("masked") or f"[Updated Neuroglancer view]({link})"
-            if link != last_loaded_url:
-                if auto_load_checkbox.value:
+    
+    # Check if streaming is available
+    use_streaming = True
+    
+    if use_streaming:
+        # Streaming path
+        try:
+            accumulated_message = ""
+            tool_names = []
+            mutated = False
+            state_link = None
+            has_yielded = False
+            event_count = 0
+            
+            async with httpx.AsyncClient(timeout=120) as client:
+                chat_payload = {"messages": [{"role": "user", "content": contents}]}
+                
+                async with client.stream(
+                    "POST",
+                    f"{BACKEND}/agent/chat/stream",
+                    json=chat_payload
+                ) as response:
+                    logger.info(f"Streaming response status: {response.status_code}")
+                    
+                    # Buffer for accumulating text
+                    buffer = ""
+                    chunk_count = 0
+                    async for chunk in response.aiter_text():
+                        chunk_count += 1
+                        buffer += chunk
+                        logger.info(f"Chunk {chunk_count}: len={len(chunk)}, buffer_len={len(buffer)}, has_double_newline={('\\n\\n' in buffer)}")
+                        if chunk_count == 1:
+                            logger.info(f"First chunk sample: {chunk[:200]}")
+                            logger.info(f"First chunk repr: {repr(chunk[:100])}")
+                            logger.info(f"Testing splits: backslash_n={repr('\\n')}, in_chunk={repr('\\n' in chunk)}")
+                        
+                        # Split on double newlines (SSE event separator)
+                        # Try both literal and escaped newlines
+                        separator = "\\n\\n"
+                        if separator in buffer:
+                            logger.info(f"Processing event from buffer, buffer_len={len(buffer)}")
+                            event_text, buffer = buffer.split("\n\n", 1)
+                            logger.info(f"Event text: {event_text[:100]}")
+                            
+                            # Each event should start with "data: "
+                            if not event_text.startswith("data: "):
+                                logger.warning(f"Event doesn't start with 'data: ', skipping: {event_text[:50]}")
+                                continue
+                            
+                            data_str = event_text[6:]  # Remove "data: " prefix
+                            try:
+                                event = json.loads(data_str)
+                                event_count += 1
+                                event_type = event.get("type")
+                                logger.info(f"Event {event_count}: type={event_type}, keys={list(event.keys())}")
+                            except json.JSONDecodeError:
+                                logger.warning(f"Failed to parse event: {data_str[:100]}")
+                                continue
+                            
+                            # Process the event
+                            if event_type == "content":
+                                accumulated_message += event.get("delta", "")
+                                yield _mask_client_side(accumulated_message)
+                                has_yielded = True
+                            
+                            elif event_type == "tool_start":
+                                tool = event.get("tool")
+                                if tool:
+                                    tool_names.append(tool)
+                                    status.object = f"Tools: {' → '.join(tool_names)}"
+                            
+                            elif event_type == "final":
+                                mutated = event.get("mutated", False)
+                                state_link = event.get("state_link")
+                                # Use content from final event if we haven't streamed any
+                                final_content = event.get("content", "")
+                                logger.info(f"Final event: mutated={mutated}, has_yielded={has_yielded}, content_len={len(final_content)}")
+                                if not has_yielded and final_content:
+                                    accumulated_message = final_content
+                                    yield _mask_client_side(accumulated_message)
+                                    has_yielded = True
+                            
+                            elif event_type == "error":
+                                error_msg = event.get("error", "Unknown error")
+                                logger.error(f"Stream error: {error_msg}")
+                                yield f"Error: {error_msg}"
+                                has_yielded = True
+                                break
+                            
+                            elif event_type == "complete":
+                                logger.info(f"Stream complete: has_yielded={has_yielded}, accumulated_len={len(accumulated_message)}")
+                                break
+            
+            logger.info(f"Total events: {event_count}, has_yielded: {has_yielded}")
+            
+            # Handle state link and multi-view table (similar to non-streaming)
+            if mutated and state_link:
+                link = state_link.get("url")
+                latest_url.value = link
+                if link != last_loaded_url and auto_load_checkbox.value:
                     with _programmatic_viewer_update():
                         viewer.url = link
                         viewer._load_url()
@@ -369,24 +347,175 @@ async def respond(contents: str, user: str, **kwargs):
                     status.object = f"**Opened:** {link}"
                 else:
                     status.object = "New link generated (auto-load off)."
+            elif tool_names:
+                status.object = f"Tools: {' → '.join(tool_names)}"
             else:
-                status.object = "State updated (no link change)."
-            if safe_answer:
-                return f"{safe_answer}\n\n{masked}"
-            return masked
-        else:
-            if not trace:
                 status.object = "Done (no view change)."
-            # If we have an embedded table, return a structured chat message containing both text & component
-            if embedded_table_component is not None:
-                # Wrap answer + table in a single Column so ChatInterface doesn't display list repr.
+            
+            # Only yield at the end if we haven't yielded anything yet
+            if not has_yielded:
+                if accumulated_message:
+                    yield _mask_client_side(accumulated_message)
+                else:
+                    yield "(no response)"
+            
+        except Exception as e:
+            status.object = f"Streaming error: {e}"
+            yield f"Error: {e}"
+    
+    else:
+        # Fallback to non-streaming
+        try:
+            result = await agent_call(contents)
+            link = result.get("url")
+            mutated = bool(result.get("mutated"))
+            safe_answer = _mask_client_side(result.get("answer")) if result.get("answer") else None
+            trace = result.get("tool_trace") or []
+            vt = result.get("views_table")
+            if trace:
+                # Build concise status line of executed tool names in order
+                tool_names = [t.get("tool") or t.get("name") for t in trace if t]
+                if tool_names:
+                    status.object = f"Tools: {' → '.join(tool_names)}"
+
+            # Optional trace history retrieval
+            if trace_history_checkbox.value:
+                try:
+                    async with httpx.AsyncClient(timeout=30) as client:
+                        hist_resp = await client.get(f"{BACKEND}/debug/tool_trace", params={"n": trace_history_length.value})
+                    hist_data = hist_resp.json()
+                    _trace_history = hist_data.get("traces", [])
+                    if _trace_history:
+                        def _payload():
+                            payload = {
+                                "exported_at": datetime.utcnow().isoformat() + 'Z',
+                                "count": len(_trace_history),
+                                "traces": _trace_history,
+                            }
+                            return io.BytesIO(json.dumps(payload, indent=2).encode('utf-8'))
+                        trace_download.callback = _payload
+                        ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+                        trace_download.filename = f"trace_history_{ts}.json"
+                        trace_download.disabled = False
+                        # Update recent traces markdown (summaries only)
+                        lines: list[str] = []
+                        for i, t in enumerate(reversed(_trace_history), start=1):
+                            steps = t.get("steps", [])
+                            tool_chain = " → ".join(s.get("tool") for s in steps if s.get("tool"))
+                            mutated_flag = "✅" if t.get("mutated") else "–"
+                            final_msg = (t.get("final_message", {}).get("content") or "").strip()
+                            final_msg = final_msg[:120] + ("…" if len(final_msg) > 120 else "")
+                            lines.append(f"**{i}.** {mutated_flag} {tool_chain or '(no tools)'}\n> {final_msg}")
+                        if lines:
+                            _recent_traces_view.object = "\n\n".join(lines)
+                            _recent_traces_accordion.active = [0]
+                        else:
+                            _recent_traces_view.object = "No traces yet."
+                except Exception as e:  # pragma: no cover
+                    status.object += f" | Trace err: {e}"
+
+            # Render multi-view table if present
+            # If multi-view tool returned an error, surface it clearly (and any warnings)
+            if vt and isinstance(vt, dict) and vt.get("error"):
+                warn_txt = ""
+                if vt.get("warnings"):
+                    warn_txt = "\n\nWarnings:\n- " + "\n- ".join(vt.get("warnings") or [])
+                status.object = f"Multi-view error: {vt.get('error')}{warn_txt}"
+            embedded_table_component = None
+            # Render multi-view table if present and successful
+            if vt and isinstance(vt, dict) and vt.get("rows"):
+                rows = vt["rows"]
+                # Build DataFrame-like structure for Tabulator. Hide raw link column, show masked_link clickable.
+                import pandas as pd
+                df_rows = []
+                for r in rows:
+                    display = {k: v for k, v in r.items() if k not in ("link", "masked_link")}
+                    raw = r.get("link")
+                    # Provide a simple HTML anchor; Tabulator with html=True will render it.
+                    if raw:
+                        display["view"] = f"<a href='{raw}' target='_blank'>link</a>"
+                    df_rows.append(display)
+                if df_rows:
+                    views_table.value = pd.DataFrame(df_rows)
+                    views_table.visible = True
+                    views_table.disabled = False
+                    # Configure columns (if available) to allow HTML rendering
+                    try:
+                        views_table.formatters = {"view": {"type": "html"}}
+                    except Exception:
+                        pass
+                    # Create a lightweight embedded table (copy) for chat message rendering
+                    embedded_table_component = pn.widgets.Tabulator(
+                        views_table.value.copy(), height=220, disabled=True, selectable=False, pagination=None
+                    )
+                    try:
+                        embedded_table_component.formatters = {"view": {"type": "html"}}
+                    except Exception:
+                        pass
+                    # Add click behavior: when selecting a row, open link
+                    def _on_select(event):  # pragma: no cover UI callback
+                        if not ng_links_internal.value:
+                            return
+                        try:
+                            data = views_table.value
+                            if data is not None and hasattr(data, "index") and len(data.index) > 0 and event.new:
+                                idxs = event.new
+                                if isinstance(idxs, list) and idxs:
+                                    # Reconstruct raw link from view cell href if needed
+                                    href = data.iloc[idxs[0]].get("view")
+                                    if isinstance(href, str) and "href='" in href:
+                                        try:
+                                            raw_link = href.split("href='",1)[1].split("'",1)[0]
+                                            _load_internal_link(raw_link)
+                                        except Exception:
+                                            pass
+                        except Exception:
+                            pass
+                    global _views_table_watcher_added
+                    if not _views_table_watcher_added:
+                        try:
+                            views_table.param.watch(_on_select, 'selection')
+                            _views_table_watcher_added = True
+                        except Exception:
+                            # Fallback: silently ignore if watcher cannot be set (should not happen normally)
+                            pass
+                # Auto-load first link if auto-load enabled
+                if ng_links_internal.value and auto_load_checkbox.value and rows:
+                    _load_internal_link(rows[0].get("link"))
+
+            if mutated and link and not vt:  # avoid duplicate load after views_table logic
+                latest_url.value = link
+                masked = result.get("masked") or f"[Updated Neuroglancer view]({link})"
+                if link != last_loaded_url:
+                    if auto_load_checkbox.value:
+                        with _programmatic_viewer_update():
+                            viewer.url = link
+                            viewer._load_url()
+                        last_loaded_url = link
+                        status.object = f"**Opened:** {link}"
+                    else:
+                        status.object = "New link generated (auto-load off)."
+                else:
+                    status.object = "State updated (no link change)."
                 if safe_answer:
-                    return pn.Column(pn.pane.Markdown(safe_answer), embedded_table_component, sizing_mode="stretch_width")
-                return pn.Column(embedded_table_component, sizing_mode="stretch_width")
-            return safe_answer if safe_answer else "(no response)"
-    except Exception as e:
-        status.object = f"Error: {e}"
-        return f"Error: {e}"
+                    yield f"{safe_answer}\n\n{masked}"
+                else:
+                    yield masked
+            else:
+                if not trace:
+                    status.object = "Done (no view change)."
+                # If we have an embedded table, return a structured chat message containing both text & component
+                if embedded_table_component is not None:
+                    # Wrap answer + table in a single Column so ChatInterface doesn't display list repr.
+                    if safe_answer:
+                        yield pn.Column(pn.pane.Markdown(safe_answer), embedded_table_component, sizing_mode="stretch_width")
+                    else:
+                        yield pn.Column(embedded_table_component, sizing_mode="stretch_width")
+                else:
+                    yield safe_answer if safe_answer else "(no response)"
+        except Exception as e:
+            status.object = f"Error: {e}"
+            yield f"Error: {e}"
 
 # ---------------- Chat UI ----------------
 chat = ChatInterface(

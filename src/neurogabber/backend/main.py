@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), '.env'))
 
 from fastapi import FastAPI, UploadFile, Body, Query, File
+from fastapi.responses import StreamingResponse
 from .models import ChatRequest, SetView, SetLUT, AddAnnotations, HistogramReq, IngestCSV, SaveState
 from .tools.neuroglancer_state import (
     NeuroglancerState,
@@ -16,7 +17,7 @@ from .tools.neuroglancer_state import (
 from .tools.plots import sample_voxels, histogram
 from .tools.io import load_csv, top_n_rois
 from .storage.states import save_state, load_state
-from .adapters.llm import run_chat, SYSTEM_PROMPT, MODEL
+from .adapters.llm import run_chat, run_chat_stream, SYSTEM_PROMPT, MODEL
 from .tools.constants import is_mutating_tool
 from .storage.data import DataMemory, InteractionMemory
 from .observability.timing import TimingCollector
@@ -197,6 +198,102 @@ def _data_context_block(max_files: int = 10, max_summaries: int = 10) -> str:
     if mem:
         parts.append(f"Recent interactions: {mem}")
     return "\n".join(parts)
+
+
+@app.post("/agent/chat/stream")
+async def agent_chat_stream(req: ChatRequest = Body(...)):
+    """Stream agent chat responses using Server-Sent Events."""
+    import json
+    import asyncio
+    
+    async def event_generator():
+        try:
+            # Get current state summary
+            summary_text = _summarize_state(CURRENT_STATE)
+            
+            # Build conversation with system prompt and state context
+            conversation = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": f"Current viewer state summary:\n{summary_text}"}
+            ]
+            conversation.extend([m.model_dump() for m in req.messages])
+            
+            max_iters = 10
+            total_content = ""
+            
+            for iteration in range(max_iters):
+                # Send iteration start event
+                yield f"data: {json.dumps({'type': 'iteration', 'iteration': iteration})}\n\n"
+                
+                # Stream LLM response
+                accumulated_message = None
+                tool_calls = None
+                
+                for chunk in run_chat_stream(conversation):
+                    if chunk["type"] == "content":
+                        total_content += chunk["delta"]
+                        yield f"data: {json.dumps({'type': 'content', 'delta': chunk['delta']})}\n\n"
+                        await asyncio.sleep(0)  # Allow other tasks to run
+                    
+                    elif chunk["type"] == "tool_calls":
+                        tool_calls = chunk["tool_calls"]
+                        yield f"data: {json.dumps({'type': 'tool_calls', 'tool_calls': tool_calls})}\n\n"
+                    
+                    elif chunk["type"] == "done":
+                        accumulated_message = chunk["message"]
+                        usage = chunk.get("usage", {})
+                        yield f"data: {json.dumps({'type': 'llm_done', 'usage': usage})}\n\n"
+                
+                # If no tool calls, we're done
+                if not tool_calls:
+                    # Send final state link if mutated
+                    mutated = INTERACTION_MEMORY.any_mutated()
+                    state_link = None
+                    if mutated:
+                        url = CURRENT_STATE.to_url()
+                        masked = _mask_ng_urls(url)
+                        state_link = {"url": url, "masked_markdown": masked}
+                    
+                    yield f"data: {json.dumps({'type': 'final', 'content': total_content, 'mutated': mutated, 'state_link': state_link})}\n\n"
+                    break
+                
+                # Execute tools
+                conversation.append(accumulated_message)
+                
+                for tc in tool_calls:
+                    func = tc.get("function") or {}
+                    tool_name = func.get("name")
+                    args_str = func.get("arguments", "{}")
+                    
+                    yield f"data: {json.dumps({'type': 'tool_start', 'tool': tool_name})}\n\n"
+                    
+                    try:
+                        args = json.loads(args_str)
+                        result = _execute_tool_by_name(tool_name, args)
+                        yield f"data: {json.dumps({'type': 'tool_done', 'tool': tool_name, 'result': str(result)[:200]})}\n\n"
+                        
+                        conversation.append({
+                            "role": "tool",
+                            "tool_call_id": tc.get("id"),
+                            "name": tool_name,
+                            "content": json.dumps(result)
+                        })
+                    except Exception as e:
+                        error_msg = f"Tool {tool_name} error: {e}"
+                        yield f"data: {json.dumps({'type': 'tool_error', 'tool': tool_name, 'error': str(e)})}\n\n"
+                        conversation.append({
+                            "role": "tool",
+                            "tool_call_id": tc.get("id"),
+                            "name": tool_name,
+                            "content": json.dumps({"error": str(e)})
+                        })
+            
+            yield f"data: {json.dumps({'type': 'complete'})}\n\n"
+            
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+    
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.post("/agent/chat")
