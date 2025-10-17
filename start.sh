@@ -36,8 +36,10 @@ trap cleanup SIGINT SIGTERM
 
 # Start backend
 echo "Starting backend on http://127.0.0.1:8000..."
+cd src/neurogabber
 uv run uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000 &
 BACKEND_PID=$!
+cd ../..
 
 # Wait for backend to be ready
 echo "Waiting for backend to start..."
@@ -45,8 +47,10 @@ sleep 3
 
 # Start panel frontend
 echo "Starting panel frontend on http://127.0.0.1:8006..."
+cd src/neurogabber
 uv run python -m panel serve panel/panel_app.py --autoreload --port 8006 --address 127.0.0.1 --allow-websocket-origin=127.0.0.1:8006 --allow-websocket-origin=localhost:8006 &
 PANEL_PID=$!
+cd ../..
 
 # Wait a moment for panel to start
 sleep 2

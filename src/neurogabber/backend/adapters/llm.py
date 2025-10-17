@@ -3,6 +3,8 @@ from typing import List, Dict
 from openai import OpenAI
 
 _API_KEY = os.getenv("OPENAI_API_KEY")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano")  # Configurable via env var
+
 client = None
 if _API_KEY:
   client = OpenAI(api_key=_API_KEY)
@@ -297,7 +299,7 @@ def run_chat(messages: List[Dict]) -> Dict:
       "usage": {}
     }
   resp = client.chat.completions.create(
-    model="gpt-5-nano",  # any tool-capable model
+    model=MODEL,
     messages=messages,
     tools=TOOLS,
     tool_choice="auto"

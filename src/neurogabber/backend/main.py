@@ -16,7 +16,7 @@ from .tools.neuroglancer_state import (
 from .tools.plots import sample_voxels, histogram
 from .tools.io import load_csv, top_n_rois
 from .storage.states import save_state, load_state
-from .adapters.llm import run_chat, SYSTEM_PROMPT
+from .adapters.llm import run_chat, SYSTEM_PROMPT, MODEL
 from .tools.constants import is_mutating_tool
 from .storage.data import DataMemory, InteractionMemory
 from .observability.timing import TimingCollector
@@ -254,7 +254,7 @@ def chat(req: ChatRequest):
         _dbg(f"Iteration {iteration} start; messages so far={len(conversation)}")
         
         # LLM call with timing
-        with timing.llm_call(iter_timing, model="gpt-4o") as llm_ctx:
+        with timing.llm_call(iter_timing, model=MODEL) as llm_ctx:
             out = run_chat(conversation)
             # Extract token usage if available
             usage = out.get("usage", {})

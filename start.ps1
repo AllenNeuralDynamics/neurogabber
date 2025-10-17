@@ -41,7 +41,9 @@ try {
     # Start backend
     Write-Host "Starting backend on http://127.0.0.1:8000..." -ForegroundColor Green
     $BackendJob = Start-Job -ScriptBlock {
-        Set-Location $using:PWD
+        $backendPath = Join-Path $using:PWD "src\neurogabber"
+        Set-Location $backendPath
+        $env:TIMING_MODE = $using:env:TIMING_MODE
         uv run uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
     }
 
@@ -52,8 +54,10 @@ try {
     # Start panel frontend
     Write-Host "Starting panel frontend on http://127.0.0.1:8006..." -ForegroundColor Green
     $PanelJob = Start-Job -ScriptBlock {
-        Set-Location $using:PWD
+        $panelPath = Join-Path $using:PWD "src\neurogabber"
+        Set-Location $panelPath
         $env:BACKEND = "http://127.0.0.1:8000"
+        $env:TIMING_MODE = $using:env:TIMING_MODE
         uv run python -m panel serve panel/panel_app.py --autoreload --port 8006 --address 127.0.0.1 --allow-websocket-origin=127.0.0.1:8006 --allow-websocket-origin=localhost:8006
     }
 
@@ -62,23 +66,40 @@ try {
 
     Write-Host ""
     Write-Host "======================" -ForegroundColor Cyan
-    Write-Host "✓ Backend running at: http://127.0.0.1:8000" -ForegroundColor Green
-    Write-Host "✓ Panel frontend at:  http://localhost:8006" -ForegroundColor Green
-    Write-Host "✓ API docs at:        http://127.0.0.1:8000/docs" -ForegroundColor Green
+    Write-Host "[OK] Backend running at: http://127.0.0.1:8000" -ForegroundColor Green
+    Write-Host "[OK] Panel frontend at:  http://localhost:8006" -ForegroundColor Green
+    Write-Host "[OK] API docs at:        http://127.0.0.1:8000/docs" -ForegroundColor Green
     Write-Host "======================" -ForegroundColor Cyan
     Write-Host "Press Ctrl+C to stop all services" -ForegroundColor Yellow
     Write-Host ""
+    Write-Host "Streaming logs (Ctrl+C to stop):" -ForegroundColor Cyan
+    Write-Host ""
 
-    # Monitor jobs and show output
+    # Monitor jobs and show output in real-time
     while ($true) {
         # Check if jobs are still running
         if ($BackendJob.State -ne "Running" -or $PanelJob.State -ne "Running") {
+            Write-Host ""
             Write-Host "One or more services stopped unexpectedly." -ForegroundColor Red
             Receive-Job -Job $BackendJob
             Receive-Job -Job $PanelJob
             break
         }
-        Start-Sleep -Seconds 1
+        
+        # Receive and display any new output from jobs
+        $backendOutput = Receive-Job -Job $BackendJob -Keep
+        $panelOutput = Receive-Job -Job $PanelJob -Keep
+        
+        if ($backendOutput) {
+            Write-Host "[BACKEND] " -NoNewline -ForegroundColor Blue
+            Write-Host $backendOutput
+        }
+        if ($panelOutput) {
+            Write-Host "[PANEL] " -NoNewline -ForegroundColor Magenta
+            Write-Host $panelOutput
+        }
+        
+        Start-Sleep -Milliseconds 500
     }
 }
 finally {
