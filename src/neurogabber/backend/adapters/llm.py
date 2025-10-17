@@ -298,9 +298,21 @@ def run_chat(messages: List[Dict]) -> Dict:
       "choices": [{"index": 0, "message": {"role": "assistant", "content": "(LLM disabled: no OPENAI_API_KEY set)"}}],
       "usage": {}
     }
+  
+  # Enable prompt caching by adding cache_control to system messages
+  # This tells OpenAI to cache the static prefix (system prompts + tools)
+  cached_messages = []
+  for i, msg in enumerate(messages):
+    msg_copy = msg.copy()
+    # Mark the last system message for caching (must be >1024 tokens typically)
+    if msg.get("role") == "system" and i < len(messages) - 1 and messages[i + 1].get("role") != "system":
+      # This is the last system message before user messages
+      msg_copy["cache_control"] = {"type": "ephemeral"}
+    cached_messages.append(msg_copy)
+  
   resp = client.chat.completions.create(
     model=MODEL,
-    messages=messages,
+    messages=cached_messages,
     tools=TOOLS,
     tool_choice="auto"
   )
@@ -320,10 +332,19 @@ def run_chat_stream(messages: List[Dict]):
     yield {"type": "content", "delta": "(LLM disabled: no OPENAI_API_KEY set)"}
     yield {"type": "done", "message": {"role": "assistant", "content": "(LLM disabled: no OPENAI_API_KEY set)"}, "usage": {}}
     return
+  
+  # Enable prompt caching by adding cache_control to system messages
+  cached_messages = []
+  for i, msg in enumerate(messages):
+    msg_copy = msg.copy()
+    # Mark the last system message for caching
+    if msg.get("role") == "system" and i < len(messages) - 1 and messages[i + 1].get("role") != "system":
+      msg_copy["cache_control"] = {"type": "ephemeral"}
+    cached_messages.append(msg_copy)
     
   stream = client.chat.completions.create(
     model=MODEL,
-    messages=messages,
+    messages=cached_messages,
     tools=TOOLS,
     tool_choice="auto",
     stream=True
