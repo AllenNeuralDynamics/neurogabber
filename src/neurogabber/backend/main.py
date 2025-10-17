@@ -1,5 +1,6 @@
 import os
 import re
+from typing import Optional
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -18,6 +19,7 @@ from .storage.states import save_state, load_state
 from .adapters.llm import run_chat, SYSTEM_PROMPT
 from .tools.constants import is_mutating_tool
 from .storage.data import DataMemory, InteractionMemory
+from .observability.timing import TimingCollector
 import polars as pl
 
 import logging
@@ -207,23 +209,61 @@ def chat(req: ChatRequest):
     Returns the final model response (with intermediate tool messages NOT included
     to keep client payload small) plus optional `state_link` if a mutating tool ran.
     """
-    state_summary = _summarize_state(CURRENT_STATE)
-    data_context = _data_context_block()
-    base_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "system", "content": f"Current viewer state summary:\n{state_summary}"},
-        {"role": "system", "content": data_context},
-    ]
-    conversation = base_messages + [m.model_dump() for m in req.messages]
+    # Initialize timing collector
+    user_prompt = next((m.content for m in req.messages if m.role == "user"), "")
+    timing = TimingCollector(user_prompt=user_prompt or "")
+    timing.mark("request_received")
+    
+    # Prompt assembly phase
+    with timing.phase("prompt_assembly"):
+        import time as _time
+        t_state_start = _time.perf_counter()
+        state_summary = _summarize_state(CURRENT_STATE)
+        t_state = _time.perf_counter() - t_state_start
+        
+        t_data_start = _time.perf_counter()
+        data_context = _data_context_block()
+        t_data = _time.perf_counter() - t_data_start
+        
+        t_memory_start = _time.perf_counter()
+        # Interaction memory is accessed within _data_context_block, so we approximate
+        t_memory = _time.perf_counter() - t_memory_start
+        
+        # Estimate total chars in context
+        total_chars = len(SYSTEM_PROMPT) + len(state_summary) + len(data_context)
+        timing.set_context_timing(t_state, t_data, t_memory, total_chars)
+        
+        base_messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": f"Current viewer state summary:\n{state_summary}"},
+            {"role": "system", "content": data_context},
+        ]
+        conversation = base_messages + [m.model_dump() for m in req.messages]
+    
     max_iters = 3
     overall_mutated = False
     tool_execution_records = []  # truncated records for response
     full_trace_steps = []  # full detail trace retained server-side
     aggregated_views_table = None
 
+    timing.start_agent_loop()
+    
     for iteration in range(max_iters):
+        iter_timing = timing.start_iteration(iteration)
+        
         _dbg(f"Iteration {iteration} start; messages so far={len(conversation)}")
-        out = run_chat(conversation)
+        
+        # LLM call with timing
+        with timing.llm_call(iter_timing, model="gpt-4o") as llm_ctx:
+            out = run_chat(conversation)
+            # Extract token usage if available
+            usage = out.get("usage", {})
+            if usage:
+                llm_ctx.set_tokens(
+                    prompt=usage.get("prompt_tokens", 0),
+                    completion=usage.get("completion_tokens", 0)
+                )
+        
         choices = out.get("choices") or []
         if not choices:
             _dbg("No choices returned by model; breaking loop")
@@ -258,7 +298,16 @@ def chat(req: ChatRequest):
             except Exception:
                 args = {}
             _dbg(f"Executing tool '{fn}' args={args}")
-            result_payload = _execute_tool_by_name(fn, args)
+            
+            # Tool execution with timing
+            with timing.tool_execution(iter_timing, fn) as tool_ctx:
+                result_payload = _execute_tool_by_name(fn, args)
+                # Measure sizes
+                tool_ctx.set_sizes(
+                    args=len(_json.dumps(args)),
+                    result=len(_json.dumps(result_payload))
+                )
+            
             _dbg(f"Tool '{fn}' result keys={list(result_payload.keys())}")
             if fn == "data_ng_views_table" and isinstance(result_payload, dict):
                 if "error" in result_payload and "rows" not in result_payload:
@@ -301,57 +350,61 @@ def chat(req: ChatRequest):
                 "content": truncated,
             })
         # Continue loop for next model reasoning pass
+    
+    timing.end_agent_loop()
+    
     # After loop, optionally append state link if mutated and user likely wants it
-    state_link_block = None
-    if overall_mutated:
+    with timing.phase("response_assembly"):
+        state_link_block = None
+        if overall_mutated:
+            try:
+                url = CURRENT_STATE.to_url()
+                masked = _mask_ng_urls(url)
+                state_link_block = {"url": url, "masked_markdown": masked}
+            except Exception:  # pragma: no cover
+                logger.exception("Failed generating state link")
+
+        # Update interaction memory (store last user + final assistant short snippet)
         try:
-            url = CURRENT_STATE.to_url()
-            masked = _mask_ng_urls(url)
-            state_link_block = {"url": url, "masked_markdown": masked}
+            user_last = next((m.content for m in reversed(req.messages) if m.role == "user"), None)
+            if user_last:
+                INTERACTION_MEMORY.remember(f"User:{(user_last or '')[:120]}")
+            # Find last assistant message in conversation
+            for cm in reversed(conversation):
+                if cm.get("role") == "assistant" and cm.get("content"):
+                    INTERACTION_MEMORY.remember(f"Assistant:{cm['content'][:300]}")
+                    break
         except Exception:  # pragma: no cover
-            logger.exception("Failed generating state link")
+            logger.exception("Failed to update interaction memory")
 
-    # Update interaction memory (store last user + final assistant short snippet)
-    try:
-        user_last = next((m.content for m in reversed(req.messages) if m.role == "user"), None)
-        if user_last:
-            INTERACTION_MEMORY.remember(f"User:{(user_last or '')[:120]}")
-        # Find last assistant message in conversation
+        # Prepare final response shaped like OpenAI response with extra fields
+        final_assistant = None
         for cm in reversed(conversation):
-            if cm.get("role") == "assistant" and cm.get("content"):
-                INTERACTION_MEMORY.remember(f"Assistant:{cm['content'][:300]}")
+            if cm.get("role") == "assistant":
+                final_assistant = cm
                 break
-    except Exception:  # pragma: no cover
-        logger.exception("Failed to update interaction memory")
+        if final_assistant is None:
+            final_assistant = {"role": "assistant", "content": "(no response)"}
 
-    # Prepare final response shaped like OpenAI response with extra fields
-    final_assistant = None
-    for cm in reversed(conversation):
-        if cm.get("role") == "assistant":
-            final_assistant = cm
-            break
-    if final_assistant is None:
-        final_assistant = {"role": "assistant", "content": "(no response)"}
-
-    # Persist full trace (bounded)
-    try:
-        _TRACE_HISTORY.append({
-            "mutated": overall_mutated,
-            "final_message": final_assistant,
-            "steps": full_trace_steps,
-        })
-        if len(_TRACE_HISTORY) > _TRACE_HISTORY_MAX:
-            del _TRACE_HISTORY[:-_TRACE_HISTORY_MAX]
-    except Exception:  # pragma: no cover
-        logger.exception("Failed storing trace history")
-
-    # If multi-view tool ran, override state_link with its first_link for continuity
-    if aggregated_views_table and aggregated_views_table.get("first_link") and state_link_block is None:
+        # Persist full trace (bounded)
         try:
-            first_url = aggregated_views_table["first_link"]
-            state_link_block = {"url": first_url, "masked_markdown": _mask_ng_urls(first_url)}
-        except Exception:
-            pass
+            _TRACE_HISTORY.append({
+                "mutated": overall_mutated,
+                "final_message": final_assistant,
+                "steps": full_trace_steps,
+            })
+            if len(_TRACE_HISTORY) > _TRACE_HISTORY_MAX:
+                del _TRACE_HISTORY[:-_TRACE_HISTORY_MAX]
+        except Exception:  # pragma: no cover
+            logger.exception("Failed storing trace history")
+
+        # If multi-view tool ran, override state_link with its first_link for continuity
+        if aggregated_views_table and aggregated_views_table.get("first_link") and state_link_block is None:
+            try:
+                first_url = aggregated_views_table["first_link"]
+                state_link_block = {"url": first_url, "masked_markdown": _mask_ng_urls(first_url)}
+            except Exception:
+                pass
 
     final_payload = {
         "model": "iterative",
@@ -362,6 +415,10 @@ def chat(req: ChatRequest):
         "tool_trace": tool_execution_records,
         "views_table": aggregated_views_table,
     }
+    
+    timing.mark("response_sent")
+    timing.finalize()
+    
     _dbg(f"Returning payload mutated={overall_mutated} state_link?={bool(state_link_block)} views_table_rows={len((aggregated_views_table or {}).get('rows', [])) if aggregated_views_table else 0}")
     return final_payload
 
@@ -371,6 +428,28 @@ def debug_tool_trace(n: int = 1):
     """Return the last n full tool traces (untruncated)."""
     n = max(1, min(n, 10))
     return {"traces": _TRACE_HISTORY[-n:]}
+
+
+@app.get("/debug/timing")
+def debug_timing(n: Optional[int] = None):
+    """Return timing statistics and recent timing records.
+    
+    Args:
+        n: Number of recent records to include (default: all available, max 100)
+    
+    Returns:
+        JSON with summary stats and recent timing records table
+    """
+    from .observability.timing import get_timing_stats, get_recent_records
+    
+    stats = get_timing_stats()
+    records = get_recent_records(n)
+    
+    return {
+        "stats": stats,
+        "records": records,
+        "count": len(records)
+    }
 
 
 def _truncate_tool_output(obj, max_chars: int = 4000):

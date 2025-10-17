@@ -1,0 +1,5 @@
+# Ignore timing logs
+*.jsonl
+
+# But keep this directory in git
+!.gitignore

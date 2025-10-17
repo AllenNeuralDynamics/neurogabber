@@ -19,6 +19,10 @@
         ```
     + open browser: http://localhost:8006
 
++ **Quick start with launch scripts:**
+    + Bash: `./start.sh` or `./start.sh --timing` (enable performance monitoring)
+    + PowerShell: `.\start.ps1` or `.\start.ps1 -Timing` (enable performance monitoring)
+
 + tests
     + `uv run -m coverage run -m pytest`
     + `uv run -m coverage report`
@@ -138,6 +142,7 @@ To prevent excessive backend updates during URL editing, the panel includes conf
 * **JSON Pointer Expansion**: Automatic detection and expansion of s3://, gs://, and http(s):// pointer URLs
 * **Configurable Debounce**: User-adjustable update interval with intelligent programmatic bypass
 * **Cloud Storage Integration**: Optional boto3 and google-cloud-storage support with graceful dependency handling
+* **Performance Monitoring**: Optional timing instrumentation for agent loop performance analysis (see `docs/timing.md`)
 
 ## Neuroglancer State Handling
 
