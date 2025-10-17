@@ -220,6 +220,7 @@ async def agent_chat_stream(req: ChatRequest = Body(...)):
             
             max_iters = 10
             total_content = ""
+            overall_mutated = False
             
             for iteration in range(max_iters):
                 # Send iteration start event
@@ -246,15 +247,6 @@ async def agent_chat_stream(req: ChatRequest = Body(...)):
                 
                 # If no tool calls, we're done
                 if not tool_calls:
-                    # Send final state link if mutated
-                    mutated = INTERACTION_MEMORY.any_mutated()
-                    state_link = None
-                    if mutated:
-                        url = CURRENT_STATE.to_url()
-                        masked = _mask_ng_urls(url)
-                        state_link = {"url": url, "masked_markdown": masked}
-                    
-                    yield f"data: {json.dumps({'type': 'final', 'content': total_content, 'mutated': mutated, 'state_link': state_link})}\n\n"
                     break
                 
                 # Execute tools
@@ -270,7 +262,17 @@ async def agent_chat_stream(req: ChatRequest = Body(...)):
                     try:
                         args = json.loads(args_str)
                         result = _execute_tool_by_name(tool_name, args)
-                        yield f"data: {json.dumps({'type': 'tool_done', 'tool': tool_name, 'result': str(result)[:200]})}\n\n"
+                        
+                        # Track if this tool mutates state
+                        if is_mutating_tool(tool_name):
+                            overall_mutated = True
+                        
+                        # Convert result to string safely for streaming
+                        result_str = str(result) if result is not None else ""
+                        # Limit very large results to prevent memory issues
+                        if len(result_str) > 5000:
+                            result_str = result_str[:5000] + "... (truncated)"
+                        yield f"data: {json.dumps({'type': 'tool_done', 'tool': tool_name, 'result': result_str})}\n\n"
                         
                         conversation.append({
                             "role": "tool",
@@ -288,6 +290,14 @@ async def agent_chat_stream(req: ChatRequest = Body(...)):
                             "content": json.dumps({"error": str(e)})
                         })
             
+            # After loop completes, send final event with accumulated content
+            state_link = None
+            if overall_mutated:
+                url = CURRENT_STATE.to_url()
+                masked = _mask_ng_urls(url)
+                state_link = {"url": url, "masked_markdown": masked}
+            
+            yield f"data: {json.dumps({'type': 'final', 'content': total_content, 'mutated': overall_mutated, 'state_link': state_link})}\n\n"
             yield f"data: {json.dumps({'type': 'complete'})}\n\n"
             
         except Exception as e:

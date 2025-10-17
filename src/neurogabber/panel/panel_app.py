@@ -277,9 +277,7 @@ async def respond(contents: str, user: str, **kwargs):
                             logger.info(f"Testing splits: backslash_n={repr('\\n')}, in_chunk={repr('\\n' in chunk)}")
                         
                         # Split on double newlines (SSE event separator)
-                        # Try both literal and escaped newlines
-                        separator = "\\n\\n"
-                        if separator in buffer:
+                        while "\n\n" in buffer:
                             logger.info(f"Processing event from buffer, buffer_len={len(buffer)}")
                             event_text, buffer = buffer.split("\n\n", 1)
                             logger.info(f"Event text: {event_text[:100]}")
@@ -522,7 +520,7 @@ chat = ChatInterface(
     user="User",
     avatar="👤",
     callback_user="Agent",
-    show_activity_dot=True,
+    show_activity_dot=False,
     callback=respond,         # async callback
     height=1000,
     show_button_name=False,
