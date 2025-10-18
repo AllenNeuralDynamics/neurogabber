@@ -1,8 +1,9 @@
 # Start neurogabber backend and frontend
-# Usage: .\start.ps1 [-Timing]
+# Usage: .\start.ps1 [-Timing] [-NoStreaming]
 
 param(
-    [switch]$Timing
+    [switch]$Timing,
+    [switch]$NoStreaming
 )
 
 Write-Host "Starting neurogabber..." -ForegroundColor Cyan
@@ -17,6 +18,14 @@ if ($Timing) {
     Write-Host "Timing mode ENABLED - performance metrics will be logged to ./logs/agent_timing.jsonl" -ForegroundColor Yellow
 } else {
     $env:TIMING_MODE = "false"
+}
+
+# Check for streaming mode flag
+if ($NoStreaming) {
+    $env:USE_STREAMING = "false"
+    Write-Host "Streaming mode DISABLED - using non-streaming chat endpoint" -ForegroundColor Yellow
+} else {
+    $env:USE_STREAMING = "true"
 }
 
 # Check if uv is available
@@ -58,6 +67,7 @@ try {
         Set-Location $panelPath
         $env:BACKEND = "http://127.0.0.1:8000"
         $env:TIMING_MODE = $using:env:TIMING_MODE
+        $env:USE_STREAMING = $using:env:USE_STREAMING
         uv run python -m panel serve panel/panel_app.py --autoreload --port 8006 --address 127.0.0.1 --allow-websocket-origin=127.0.0.1:8006 --allow-websocket-origin=localhost:8006
     }
 

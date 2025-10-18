@@ -37,6 +37,7 @@ pn.extension(
 )
 
 BACKEND = os.environ.get("BACKEND", "http://127.0.0.1:8000")
+USE_STREAMING = os.environ.get("USE_STREAMING", "true").lower() == "true"
 
 viewer = Neuroglancer()
 status = pn.pane.Markdown("Ready.")
@@ -241,10 +242,7 @@ async def respond(contents: str, user: str, **kwargs):
     global last_loaded_url, _trace_history
     status.object = "Running…"
     
-    # Check if streaming is available
-    use_streaming = True
-    
-    if use_streaming:
+    if USE_STREAMING:
         # Streaming path
         try:
             accumulated_message = ""

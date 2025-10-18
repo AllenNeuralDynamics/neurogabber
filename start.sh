@@ -1,6 +1,6 @@
 #!/bin/bash
 # Start neurogabber backend and frontend
-# Usage: ./start.sh [--timing]
+# Usage: ./start.sh [--timing] [--no-streaming]
 
 set -e
 
@@ -12,11 +12,20 @@ export BACKEND="http://127.0.0.1:8000"
 
 # Check for timing mode flag
 TIMING_MODE="false"
-if [[ "$1" == "--timing" ]]; then
-    TIMING_MODE="true"
-    echo "Timing mode ENABLED - performance metrics will be logged to ./logs/agent_timing.jsonl"
-fi
+USE_STREAMING="true"
+
+for arg in "$@"; do
+    if [[ "$arg" == "--timing" ]]; then
+        TIMING_MODE="true"
+        echo "Timing mode ENABLED - performance metrics will be logged to ./logs/agent_timing.jsonl"
+    elif [[ "$arg" == "--no-streaming" ]]; then
+        USE_STREAMING="false"
+        echo "Streaming mode DISABLED - using non-streaming chat endpoint"
+    fi
+done
+
 export TIMING_MODE
+export USE_STREAMING
 
 # Check if uv is available
 if ! command -v uv &> /dev/null; then
