@@ -262,29 +262,17 @@ async def respond(contents: str, user: str, **kwargs):
                     f"{BACKEND}/agent/chat/stream",
                     json=chat_payload
                 ) as response:
-                    logger.info(f"Streaming response status: {response.status_code}")
-                    
                     # Buffer for accumulating text
                     buffer = ""
-                    chunk_count = 0
                     async for chunk in response.aiter_text():
-                        chunk_count += 1
                         buffer += chunk
-                        logger.info(f"Chunk {chunk_count}: len={len(chunk)}, buffer_len={len(buffer)}, has_double_newline={('\\n\\n' in buffer)}")
-                        if chunk_count == 1:
-                            logger.info(f"First chunk sample: {chunk[:200]}")
-                            logger.info(f"First chunk repr: {repr(chunk[:100])}")
-                            logger.info(f"Testing splits: backslash_n={repr('\\n')}, in_chunk={repr('\\n' in chunk)}")
                         
                         # Split on double newlines (SSE event separator)
                         while "\n\n" in buffer:
-                            logger.info(f"Processing event from buffer, buffer_len={len(buffer)}")
                             event_text, buffer = buffer.split("\n\n", 1)
-                            logger.info(f"Event text: {event_text[:100]}")
                             
                             # Each event should start with "data: "
                             if not event_text.startswith("data: "):
-                                logger.warning(f"Event doesn't start with 'data: ', skipping: {event_text[:50]}")
                                 continue
                             
                             data_str = event_text[6:]  # Remove "data: " prefix
@@ -292,9 +280,8 @@ async def respond(contents: str, user: str, **kwargs):
                                 event = json.loads(data_str)
                                 event_count += 1
                                 event_type = event.get("type")
-                                logger.info(f"Event {event_count}: type={event_type}, keys={list(event.keys())}")
                             except json.JSONDecodeError:
-                                logger.warning(f"Failed to parse event: {data_str[:100]}")
+                                logger.warning(f"Failed to parse SSE event")
                                 continue
                             
                             # Process the event
@@ -314,7 +301,6 @@ async def respond(contents: str, user: str, **kwargs):
                                 state_link = event.get("state_link")
                                 # Use content from final event if we haven't streamed any
                                 final_content = event.get("content", "")
-                                logger.info(f"Final event: mutated={mutated}, has_yielded={has_yielded}, content_len={len(final_content)}")
                                 if not has_yielded and final_content:
                                     accumulated_message = final_content
                                     yield _mask_client_side(accumulated_message)
@@ -328,10 +314,7 @@ async def respond(contents: str, user: str, **kwargs):
                                 break
                             
                             elif event_type == "complete":
-                                logger.info(f"Stream complete: has_yielded={has_yielded}, accumulated_len={len(accumulated_message)}")
                                 break
-            
-            logger.info(f"Total events: {event_count}, has_yielded: {has_yielded}")
             
             # Handle state link and multi-view table (similar to non-streaming)
             if mutated and state_link:
