@@ -3,6 +3,7 @@ from typing import List, Dict
 from openai import OpenAI
 
 _API_KEY = os.getenv("OPENAI_API_KEY")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")  # Configurable via env var
 MODEL = os.getenv("OPENAI_MODEL", "gpt-5-nano")  # Configurable via env var
 
 client = None
@@ -20,7 +21,12 @@ Decision rules:
 - Do not paste raw Neuroglancer URLs directly; always rely on ng_state_link for sharing the current view.
 
 Dataframe rules:
-- If the user wants a random sample, assume no seed, without replacement, and uniforming across all rows. Unless otherwise specificed. 
+- For simple operations, use specific tools (data_sample, data_preview, data_describe, data_select).
+- For complex queries (multiple filters, aggregations, computed columns, sorting), use data_query_polars with a Polars expression.
+- In data_query_polars: use 'df' for the dataframe and 'pl' for Polars functions. All standard Polars operations are supported.
+- If you want to reuse a query result, use save_as parameter to store it as a summary table, then reference it with summary_id in subsequent queries.
+- If the user wants a random sample, assume no seed, without replacement, and uniforming across all rows. Unless otherwise specificed.
+
 Keep answers concise. Provide brief rationale before tool calls when helpful. Avoid redundant summaries."""
 
 # Define available tools (schemas must match your Pydantic models)
@@ -285,6 +291,27 @@ DATA_TOOLS = [
       "parameters": {"type": "object", "properties": {}}
     }
   },
+  {
+    "type": "function",
+    "function": {
+      "name": "data_query_polars",
+      "description": "Execute Polars expression on a dataframe. Supports any Polars operations (filter, select, group_by, agg, with_columns, sort, etc.). Use this for complex queries that would require multiple tool calls otherwise. Returns resulting dataframe.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file_id": {"type": "string", "description": "Source dataframe file_id (provide either file_id OR summary_id, not both)"},
+          "summary_id": {"type": "string", "description": "Source summary table id (mutually exclusive with file_id)"},
+          "expression": {
+            "type": "string",
+            "description": "Polars expression to execute. Use 'df' to reference the dataframe and 'pl' for Polars functions. Example: 'df.filter(pl.col(\"age\") > 30).select([\"id\", \"name\"]).sort(\"name\").limit(10)'"
+          },
+          "save_as": {"type": "string", "description": "Optional: save result as a named summary table for reuse in subsequent queries"},
+          "limit": {"type": "integer", "default": 100, "minimum": 1, "maximum": 1000, "description": "Maximum rows to return"}
+        },
+        "required": ["expression"]
+      }
+    }
+  },
 ]
 
 TOOLS = TOOLS + DATA_TOOLS
@@ -314,7 +341,8 @@ def run_chat(messages: List[Dict]) -> Dict:
     model=MODEL,
     messages=cached_messages,
     tools=TOOLS,
-    tool_choice="auto"
+    tool_choice="auto",
+    reasoning_effort="minimal"
   )
   return resp.model_dump()
 

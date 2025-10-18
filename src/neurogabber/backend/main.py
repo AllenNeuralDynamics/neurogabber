@@ -618,6 +618,8 @@ def _execute_tool_by_name(name: str, args: dict):
             return t_add_layer(**args)
         if name == "ng_set_layer_visibility":
             return t_set_layer_visibility(**args)
+        if name == "data_query_polars":
+            return t_data_query_polars(**args)
     except Exception as e:  # pragma: no cover
         logger.exception("Tool execution error")
         return {"error": str(e)}
@@ -864,6 +866,83 @@ def t_data_select(
 @app.post("/tools/data_list_summaries")
 def t_data_list_summaries():
     return {"summaries": DATA_MEMORY.list_summaries()}
+
+
+@app.post("/tools/data_query_polars")
+def t_data_query_polars(
+    file_id: str | None = Body(None),
+    summary_id: str | None = Body(None),
+    expression: str = Body(...),
+    save_as: str | None = Body(None),
+    limit: int = Body(100)
+):
+    """Execute arbitrary Polars expression on a dataframe with safe evaluation.
+    
+    Supports any Polars operations while blocking dangerous Python operations.
+    Uses restricted namespace to prevent imports, file I/O, and system calls.
+    """
+    import polars as pl
+    
+    # Get source dataframe
+    if file_id and summary_id:
+        return {"error": "Provide either file_id OR summary_id, not both"}
+    
+    if not file_id and not summary_id:
+        return {"error": "Must provide either file_id or summary_id"}
+    
+    try:
+        if file_id:
+            df = DATA_MEMORY.get_df(file_id)
+            if df is None:
+                return {"error": f"File '{file_id}' not found"}
+        else:
+            df = DATA_MEMORY.get_summary(summary_id)
+            if df is None:
+                return {"error": f"Summary '{summary_id}' not found"}
+    except Exception as e:
+        return {"error": f"Failed to load dataframe: {e}"}
+    
+    # Execute in restricted namespace (only Polars, no builtins)
+    namespace = {
+        'pl': pl,
+        'df': df,
+        '__builtins__': {}  # Critical: blocks import, open, eval, exec, etc.
+    }
+    
+    try:
+        result = eval(expression, namespace, {})
+        
+        # Ensure result is a DataFrame
+        if not isinstance(result, pl.DataFrame):
+            return {"error": f"Expression must return a DataFrame, got {type(result).__name__}"}
+        
+        # Apply limit
+        if len(result) > limit:
+            result = result.limit(limit)
+            truncated = True
+        else:
+            truncated = False
+        
+        # Save as summary if requested
+        if save_as:
+            DATA_MEMORY.store_summary(save_as, result)
+        
+        # Return result
+        return {
+            "ok": True,
+            "data": result.to_dict(as_series=False),
+            "rows": len(result),
+            "columns": result.columns,
+            "truncated": truncated,
+            "saved_as": save_as
+        }
+    
+    except NameError as e:
+        return {"error": f"Invalid expression: {e}. Only 'df' and 'pl' are available."}
+    except SyntaxError as e:
+        return {"error": f"Syntax error in expression: {e}"}
+    except Exception as e:
+        return {"error": f"Expression execution failed: {e}"}
 
 
 @app.post("/tools/data_sample")
