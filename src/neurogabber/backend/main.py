@@ -40,6 +40,12 @@ def _dbg(msg: str):  # lightweight wrapper to centralize debug guard
 
 app = FastAPI()
 
+# Log debug mode status on startup
+if DEBUG_ENABLED:
+    logger.warning("🔍 DEBUG MODE ENABLED - Verbose logging active (NEUROGABBER_DEBUG=1)")
+else:
+    logger.info("Debug mode disabled. Set NEUROGABBER_DEBUG=1 to enable verbose logging.")
+
 # In-memory working state per session (MVP). Replace with DB keyed by user/session.
 CURRENT_STATE = NeuroglancerState()
 DATA_MEMORY = DataMemory()
@@ -183,9 +189,15 @@ def _data_context_block(max_files: int = 10, max_summaries: int = 10) -> str:
     sums = DATA_MEMORY.list_summaries()[:max_summaries]
     parts = ["Data context:"]
     if files:
-        parts.append("Files:")
-        for f in files:
-            parts.append(f"- {f['file_id']} {f['name']} rows={f['n_rows']} cols={f['n_cols']} cols={f['columns'][:6]}...")
+        # Highlight the most recent file
+        most_recent = files[-1] if files else None
+        if most_recent:
+            parts.append(f"Most recent file (use this by default): file_id='{most_recent['file_id']}' name='{most_recent['name']}' rows={most_recent['n_rows']} cols={most_recent['columns']}")
+        
+        if len(files) > 1:
+            parts.append("Other files:")
+            for f in files[:-1]:
+                parts.append(f"- {f['file_id']} {f['name']} rows={f['n_rows']} cols={f['n_cols']} cols={f['columns'][:6]}...")
     else:
         parts.append("Files: (none)")
     if sums:
@@ -458,6 +470,31 @@ def chat(req: ChatRequest):
             })
         # Continue loop for next model reasoning pass
     
+    # If we exhausted max_iters but still have pending tool results, get final response
+    if iteration == max_iters - 1:
+        # Check if last message is a tool result (not assistant)
+        if conversation and conversation[-1].get("role") == "tool":
+            _dbg("Max iterations reached but last message is tool result; making final LLM call")
+            iter_timing = timing.start_iteration(max_iters)
+            
+            with timing.llm_call(iter_timing, model=MODEL) as llm_ctx:
+                out = run_chat(conversation)
+                usage = out.get("usage", {})
+                if usage:
+                    llm_ctx.set_tokens(
+                        prompt=usage.get("prompt_tokens", 0),
+                        completion=usage.get("completion_tokens", 0)
+                    )
+            
+            choices = out.get("choices") or []
+            if choices:
+                msg = choices[0].get("message") or {}
+                content = msg.get("content")
+                if isinstance(content, str):
+                    msg["content"] = _mask_ng_urls(content)
+                conversation.append(msg)
+                _dbg("Final response added after max_iters")
+    
     timing.end_agent_loop()
     
     # After loop, optionally append state link if mutated and user likely wants it
@@ -619,7 +656,8 @@ def _execute_tool_by_name(name: str, args: dict):
         if name == "ng_set_layer_visibility":
             return t_set_layer_visibility(**args)
         if name == "data_query_polars":
-            return t_data_query_polars(**args)
+            _dbg(f"Dispatching data_query_polars with args: {args}")
+            return execute_query_polars(**args)  # Call core function directly, no Body objects!
     except Exception as e:  # pragma: no cover
         logger.exception("Tool execution error")
         return {"error": str(e)}
@@ -868,35 +906,75 @@ def t_data_list_summaries():
     return {"summaries": DATA_MEMORY.list_summaries()}
 
 
-@app.post("/tools/data_query_polars")
-def t_data_query_polars(
-    file_id: str | None = Body(None),
-    summary_id: str | None = Body(None),
-    expression: str = Body(...),
-    save_as: str | None = Body(None),
-    limit: int = Body(100)
-):
-    """Execute arbitrary Polars expression on a dataframe with safe evaluation.
+# ==============================================================================
+# Core Tool Logic Functions (FastAPI-independent)
+# ==============================================================================
+# These functions contain pure business logic and can be called from:
+# 1. HTTP endpoints (via wrapper functions below)
+# 2. Internal tool dispatcher (direct calls from LLM)
+# 
+# Benefits:
+# - No Body() object handling needed
+# - Easy to test without FastAPI
+# - Clean separation of HTTP concerns from business logic
+# - Reusable in other contexts (CLI, SDK, etc.)
+# ==============================================================================
+
+def execute_query_polars(
+    file_id: str | None = None,
+    summary_id: str | None = None,
+    expression: str = None,
+    save_as: str | None = None,
+    limit: int = 100
+) -> dict:
+    """Core logic for executing Polars expressions on dataframes.
     
-    Supports any Polars operations while blocking dangerous Python operations.
-    Uses restricted namespace to prevent imports, file I/O, and system calls.
+    Pure business logic with no FastAPI dependencies. Can be called from
+    HTTP endpoints or internal dispatcher.
+    
+    Args:
+        file_id: Source file ID (mutually exclusive with summary_id)
+        summary_id: Source summary table ID (mutually exclusive with file_id)
+        expression: Polars expression to execute
+        save_as: Optional name to save result as summary table
+        limit: Maximum rows to return
+        
+    Returns:
+        Dict with result data or error message
     """
     import polars as pl
     
+    _dbg(f"execute_query_polars: file_id={repr(file_id)}, summary_id={repr(summary_id)}, save_as={repr(save_as)}, limit={limit}, expression={expression[:50] if expression else 'None'}...")
+    
     # Get source dataframe
     if file_id and summary_id:
-        return {"error": "Provide either file_id OR summary_id, not both"}
+        return {
+            "error": f"Provide either file_id OR summary_id, not both. Received file_id='{str(file_id)}' and summary_id='{str(summary_id)}'. Use file_id for uploaded files or summary_id for previously saved results."
+        }
     
     if not file_id and not summary_id:
-        return {"error": "Must provide either file_id or summary_id"}
+        # Auto-select most recent file if available
+        files = DATA_MEMORY.list_files()
+        if files:
+            file_id = files[-1]["file_id"]  # Most recent file
+            _dbg(f"No file_id or summary_id provided, auto-using most recent file: {file_id}")
+        else:
+            summaries = DATA_MEMORY.list_summaries()
+            return {
+                "error": "No file_id or summary_id provided and no files uploaded.",
+                "available_summaries": [s["summary_id"] for s in summaries] if summaries else [],
+                "hint": "Upload a file first, or provide summary_id to query a saved result."
+            }
     
     try:
         if file_id:
             df = DATA_MEMORY.get_df(file_id)
+            source_id = file_id
             if df is None:
                 return {"error": f"File '{file_id}' not found"}
         else:
-            df = DATA_MEMORY.get_summary(summary_id)
+            df = DATA_MEMORY.get_summary_df(summary_id)
+            source_id = summary_id
             if df is None:
                 return {"error": f"Summary '{summary_id}' not found"}
     except Exception as e:
@@ -912,9 +990,31 @@ def t_data_query_polars(
     try:
         result = eval(expression, namespace, {})
         
-        # Ensure result is a DataFrame
-        if not isinstance(result, pl.DataFrame):
-            return {"error": f"Expression must return a DataFrame, got {type(result).__name__}"}
+        # Handle different result types
+        if isinstance(result, pl.DataFrame):
+            # Standard DataFrame result
+            pass
+        elif isinstance(result, pl.Series):
+            # Convert Series to single-column DataFrame
+            result = pl.DataFrame({result.name or "value": result})
+        elif isinstance(result, list):
+            # List result (e.g., from .to_list()) - wrap in DataFrame
+            result = pl.DataFrame({"values": result})
+        elif isinstance(result, dict):
+            # Dict result - try to convert to DataFrame
+            try:
+                result = pl.DataFrame(result)
+            except Exception:
+                # If conversion fails, wrap the dict
+                result = pl.DataFrame({"result": [str(result)]})
+        elif isinstance(result, (int, float, str, bool, type(None))):
+            # Scalar result - wrap in DataFrame
+            result = pl.DataFrame({"result": [result]})
+        else:
+            return {
+                "error": f"Expression must return a DataFrame, Series, list, dict, or scalar value. Got {type(result).__name__}. "
+                "Hint: Remove .to_list() or .to_dict() and just return the DataFrame/Series."
+            }
         
         # Apply limit
         if len(result) > limit:
@@ -925,7 +1025,7 @@ def t_data_query_polars(
         
         # Save as summary if requested
         if save_as:
-            DATA_MEMORY.store_summary(save_as, result)
+            DATA_MEMORY.add_summary(source_id, "query", result, note=f"Query: {expression[:100]}")
         
         # Return result
         return {
@@ -943,6 +1043,27 @@ def t_data_query_polars(
         return {"error": f"Syntax error in expression: {e}"}
     except Exception as e:
         return {"error": f"Expression execution failed: {e}"}
+
+
+@app.post("/tools/data_query_polars")
+def t_data_query_polars(
+    file_id: str | None = Body(None, embed=True),
+    summary_id: str | None = Body(None, embed=True),
+    expression: str = Body(..., embed=True),
+    save_as: str | None = Body(None, embed=True),
+    limit: int = Body(100, embed=True)
+):
+    """HTTP endpoint wrapper for data_query_polars.
+    
+    Extracts parameters from FastAPI Body objects and delegates to core logic.
+    """
+    return execute_query_polars(
+        file_id=file_id,
+        summary_id=summary_id,
+        expression=expression,
+        save_as=save_as,
+        limit=limit
+    )
 
 
 @app.post("/tools/data_sample")

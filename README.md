@@ -24,6 +24,8 @@ uv run python -m panel serve panel\panel_app.py --autoreload --port 8006 --addre
 ```
 + open browser: http://localhost:8006
 
++ debug mode: $env:NEUROGABBER_DEBUG = "1" 
+
     
 
 ### Quick start with launch scripts:

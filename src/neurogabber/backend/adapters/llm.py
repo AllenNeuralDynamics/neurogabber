@@ -15,12 +15,14 @@ You are Neurogabber, a helpful assistant for Neuroglancer.
 
 Decision rules:
 - If the user only wants information answer directly from the provided 'Current viewer state summary' (no tools).
+- Have a bias to action. When data manipulation is mentioned, use the tool right away without checking with the user.
 - If the user wants to modify the view/viewer (camera, LUTs, annotations, layers) call the corresponding tool(s).
 - If unsure of layer names or ranges, call ng_state_summary first (detail='standard' unless user requests otherwise).
 - After performing modifications, if the user requests a link or updated view, call ng_state_link (NOT state_save) to return a masked markdown hyperlink. Only call state_save when explicit persistence is requested (e.g. 'save', 'persist', 'store').
 - Do not paste raw Neuroglancer URLs directly; always rely on ng_state_link for sharing the current view.
 
 Dataframe rules:
+- When the user mentions "data", "dataframe", "file", or "csv" without specifying which file, ALWAYS use the most recent file (shown in Data context).
 - For simple operations, use specific tools (data_sample, data_preview, data_describe, data_select).
 - For complex queries (multiple filters, aggregations, computed columns, sorting), use data_query_polars with a Polars expression.
 - In data_query_polars: use 'df' for the dataframe and 'pl' for Polars functions. All standard Polars operations are supported.
@@ -299,11 +301,11 @@ DATA_TOOLS = [
       "parameters": {
         "type": "object",
         "properties": {
-          "file_id": {"type": "string", "description": "Source dataframe file_id (provide either file_id OR summary_id, not both)"},
-          "summary_id": {"type": "string", "description": "Source summary table id (mutually exclusive with file_id)"},
+          "file_id": {"type": "string", "description": "ID of uploaded file to query. Provide file_id for original uploaded files (most common case)."},
+          "summary_id": {"type": "string", "description": "ID of a previously saved query result. Only use if you saved a result with save_as in a previous call. Do not provide both file_id and summary_id."},
           "expression": {
             "type": "string",
-            "description": "Polars expression to execute. Use 'df' to reference the dataframe and 'pl' for Polars functions. Example: 'df.filter(pl.col(\"age\") > 30).select([\"id\", \"name\"]).sort(\"name\").limit(10)'"
+            "description": "Polars expression to execute. Use 'df' to reference the dataframe and 'pl' for Polars functions. For aggregations, use df.select([pl.max('col')]) not df['col'].max(). Examples: 'df.filter(pl.col(\"age\") > 30).select([\"id\", \"name\"])' or 'df.select([pl.max(\"score\"), pl.mean(\"age\")])'"
           },
           "save_as": {"type": "string", "description": "Optional: save result as a named summary table for reuse in subsequent queries"},
           "limit": {"type": "integer", "default": 100, "minimum": 1, "maximum": 1000, "description": "Maximum rows to return"}
